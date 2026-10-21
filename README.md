@@ -13,6 +13,7 @@ The earlier inference labs got a model serving through the HyperPod Inference Op
 | [4. Autoscaling](04-autoscaling.md) | Scale replicas with KEDA on CloudWatch and Prometheus metrics, and understand scale to zero |
 | [5. Observability](05-observability.md) | Read the metrics the operator injects, apply request limits, query the metrics in Prometheus, and send operator logs to CloudWatch |
 | [6. Task governance](06-task-governance.md) | Run inference under Kueue quotas and priorities next to training jobs |
+| [7. Optimize](07-optimization.md) | Turn on tiered KV caching (LMCache with L1 and HyperPod tiered storage as L2), prefix-aware routing, and image and weights caching; measure the cache hits |
 
 Each module is self-contained, but module 1 creates the `tinyllama-dd` endpoint that modules 4 and 5 reuse.
 
@@ -28,8 +29,19 @@ With two `ml.g5.2xlarge` nodes you have two GPUs. Each module fits in that budge
 | 4. Autoscaling | 2 (`tinyllama-dd` scales from 1 to 2) |
 | 5. Observability | 1 (`tinyllama-dd`) |
 | 6. Task governance | 2 (one per team; delete `tinyllama-dd` first) |
+| 7. Optimize | 2 (one replica per GPU node; delete the other deployments first) |
 
-Pods per node are limited too. HyperPod sets each node's pod limit from one network interface's addresses: 14 on `ml.g5.2xlarge`, 29 on `ml.c5.4xlarge`. System DaemonSets use most of a GPU node's 14, which leaves room for one or two workload pods. A pod that can't fit stays `Pending` with `Too many pods`.
+Pods per node are limited too. HyperPod sets each node's pod limit from one network interface's addresses: 14 on `ml.g5.2xlarge`, 29 on `ml.c5.4xlarge`. A pod that can't fit stays `Pending` with `Too many pods`. On a GPU node:
+
+| Pods on one `ml.g5.2xlarge` | Count |
+|---|---|
+| System DaemonSets: HyperPod health agent, `aws-node`, `kube-proxy`, NVIDIA device plugin, Pod Identity agent, FSx and S3 CSI nodes | 7 |
+| Controllers `scripts/setup.sh` can't move (inference operator, inference gateway, task governance), when the scheduler places them there | 0–3 |
+| Optional observability add-on (Prometheus, modules 4 and 5): three DaemonSet pods, plus collectors the scheduler may place there | 3–6 |
+| Modules 1–6: one model pod, sometimes a training pod | 1–2 |
+| Module 7: model, tiered storage daemon, image cache, router | 3–4 |
+
+`scripts/setup.sh` moves the other controllers to the CPU node and deletes the workshop's training-image pre-pull DaemonSet, so modules 1–6 fit with observability installed. Remove observability before module 7 (`scripts/observability.sh --remove`); module 7 checks the free slots first.
 
 ## Prerequisites
 

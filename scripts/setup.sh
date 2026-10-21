@@ -4,6 +4,8 @@
 #     EKS add-on, and creates the IAM roles and TLS bucket the add-on needs
 #   - creates the model bucket (module 2), and the ECR repository and CodeBuild project (module 3)
 #   - writes env.sh at the repository root with the variables the pages use
+#   - frees pod slots on the GPU nodes (HyperPod allows 14 pods on an ml.g5.2xlarge): moves movable
+#     controllers to the CPU instance group and deletes the workshop's training-image pre-pull
 # Safe to rerun: existing resources are reused, and an installed add-on is left as it is.
 # Usage: scripts/setup.sh [-y]          (-y skips the confirmation prompt)
 #        EKS_CLUSTER_NAME=<name> scripts/setup.sh   (when the Region has more than one cluster)
@@ -87,7 +89,9 @@ cat <<EOF
 Account          : $ACCOUNT_ID
 Region           : $REGION
 HyperPod cluster : $HYPERPOD_CLUSTER_NAME ($INSTANCE_TYPE)
-Controllers on   : ${CPU_GROUP:-any node (no CPU instance group)}
+Controllers on   : ${CPU_GROUP:-any node (no CPU instance group)} (inference add-on, metrics-server,
+                   training operator, FSx CSI controller)
+Deletes          : the workshop's prepull-esm DaemonSet, if present (training-image pre-pull)
 EKS cluster      : $EKS_CLUSTER_NAME
 Inference add-on : $($ADDON_INSTALLED && echo "installed, left as it is" || echo "will install $ADDON_VERSION")
 Helm operator    : $($HELM_INSTALLED && echo "installed, will be removed" || echo "not installed")
@@ -282,6 +286,37 @@ CONFIG=$(aws eks describe-addon --cluster-name "$EKS_CLUSTER_NAME" --addon-name 
   --query addon.configurationValues --output text)
 TLS_BUCKET=$(jq -r .tlsCertificateS3Bucket <<<"$CONFIG")
 EXEC_ROLE_ARN=$(jq -r .executionRoleArn <<<"$CONFIG")
+
+log "Freeing pod slots on the GPU nodes"
+if [[ "$PLACEMENT" != "{}" ]]; then
+  # The training operator's add-on has a placement setting for its controller
+  TRAINING_ADDON=amazon-sagemaker-hyperpod-training-operator
+  if aws eks describe-addon --cluster-name "$EKS_CLUSTER_NAME" --addon-name "$TRAINING_ADDON" >/dev/null 2>&1; then
+    CURRENT=$(aws eks describe-addon --cluster-name "$EKS_CLUSTER_NAME" --addon-name "$TRAINING_ADDON" \
+      --query addon.configurationValues --output text)
+    [[ -z "$CURRENT" || "$CURRENT" == None ]] && CURRENT='{}'
+    WANTED=$(jq -c --argjson ns "$PLACEMENT" '.hpTrainingControllerManager.manager.nodeSelector = $ns' <<<"$CURRENT")
+    if [[ "$(jq -S . <<<"$WANTED")" != "$(jq -S . <<<"$CURRENT")" ]]; then
+      aws eks update-addon --cluster-name "$EKS_CLUSTER_NAME" --addon-name "$TRAINING_ADDON" \
+        --configuration-values "$WANTED" --resolve-conflicts OVERWRITE >/dev/null
+      sleep 10
+      aws eks wait addon-active --cluster-name "$EKS_CLUSTER_NAME" --addon-name "$TRAINING_ADDON"
+    fi
+    echo "training operator controller: on $CPU_GROUP"
+  fi
+  # The FSx CSI controller comes from the workshop's Helm release, which nothing reconciles afterwards
+  if kubectl -n kube-system get deploy fsx-csi-controller >/dev/null 2>&1; then
+    kubectl -n kube-system patch deploy fsx-csi-controller --type merge \
+      -p "$(jq -cn --argjson ns "$PLACEMENT" '{spec: {template: {spec: {nodeSelector: $ns}}}}')" >/dev/null
+    kubectl -n kube-system rollout status deploy/fsx-csi-controller --timeout=5m >/dev/null
+    echo "FSx CSI controller: on $CPU_GROUP"
+  fi
+fi
+# The workshop pre-pulls its training image with a DaemonSet: one pod on every node, needed only
+# before its training labs run
+if kubectl -n kube-system get ds prepull-esm >/dev/null 2>&1; then
+  kubectl -n kube-system delete ds prepull-esm >/dev/null && echo "deleted the workshop's prepull-esm DaemonSet"
+fi
 
 log "Writing $ROOT/env.sh"
 cat > "$ROOT/env.sh" <<EOF

@@ -3,14 +3,24 @@
 # creates an Amazon Managed Service for Prometheus workspace and installs the HyperPod observability
 # EKS add-on that scrapes the cluster into it. No Grafana: Workshop Studio accounts can't use
 # IAM Identity Center, which Amazon Managed Grafana needs for sign-in.
-# Safe to rerun. Run scripts/setup.sh first. Usage: scripts/observability.sh [-y]
+# Safe to rerun. Run scripts/setup.sh first.
+# Usage: scripts/observability.sh [-y]            install
+#        scripts/observability.sh --remove [-y]   uninstall the add-on, workspace, and role (before module 7,
+#                                                 whose pods need the 3 slots per node the add-on uses)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
 ADDON=amazon-sagemaker-hyperpod-observability
 AUTO_APPROVE=false
-[[ "${1:-}" == "-y" ]] && AUTO_APPROVE=true
+REMOVE=false
+for arg in "$@"; do
+  case "$arg" in
+    -y) AUTO_APPROVE=true ;;
+    --remove) REMOVE=true ;;
+    *) echo "unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -22,6 +32,37 @@ export AWS_DEFAULT_REGION=$REGION
 EKS_CLUSTER_ARN=$(aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --query cluster.arn --output text)
 ALIAS=hyperpod-dd-${HYPERPOD_CLUSTER_NAME:0:30}
 ROLE_NAME=hyperpod-dd-${HYPERPOD_CLUSTER_NAME:0:30}-observability
+
+if $REMOVE; then
+  cat <<EOF
+
+Account     : $ACCOUNT_ID
+Region      : $REGION
+EKS cluster : $EKS_CLUSTER_NAME
+Deletes: EKS add-on $ADDON, Prometheus workspace $ALIAS (and its metrics), IAM role $ROLE_NAME
+EOF
+  if ! $AUTO_APPROVE; then
+    read -r -p "Continue? [y/N] " ans || ans=""
+    [[ "$ans" =~ ^[Yy]$ ]] || die "aborted"
+  fi
+  if aws eks describe-addon --cluster-name "$EKS_CLUSTER_NAME" --addon-name "$ADDON" >/dev/null 2>&1; then
+    log "Deleting $ADDON"
+    aws eks delete-addon --cluster-name "$EKS_CLUSTER_NAME" --addon-name "$ADDON" >/dev/null
+    aws eks wait addon-deleted --cluster-name "$EKS_CLUSTER_NAME" --addon-name "$ADDON"
+  fi
+  WS_ID=$(aws amp list-workspaces --alias "$ALIAS" --query 'workspaces[0].workspaceId' --output text)
+  if [[ -n "$WS_ID" && "$WS_ID" != "None" ]]; then
+    log "Deleting Prometheus workspace $WS_ID"
+    aws amp delete-workspace --workspace-id "$WS_ID"
+  fi
+  if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+    aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name observability 2>/dev/null || true
+    aws iam delete-role --role-name "$ROLE_NAME"
+  fi
+  kubectl get pods -n hyperpod-observability --no-headers 2>/dev/null | wc -l | xargs echo "pods left in hyperpod-observability:"
+  echo "Done."
+  exit 0
+fi
 
 cat <<EOF
 
