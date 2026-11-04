@@ -337,10 +337,8 @@ export BUILD_PROJECT=$BUILD_PROJECT
 EOF
 
 log "Bash kernel for the notebooks"
-# The notebooks/ run in a Bash kernel, so variables and functions carry over from cell to cell
-if python3 -m pip install --user --quiet bash_kernel && python3 -m bash_kernel.install --user >/dev/null; then
-  echo "installed: open a notebook and select the Bash kernel (reload the window if it isn't listed)"
-else
+# Usually installed already by scripts/install-kernel.sh; rerunning it is quick and harmless
+if ! "$HERE/install-kernel.sh"; then
   echo "WARNING: could not install the Bash kernel; run the module pages in the terminal instead" >&2
 fi
 

@@ -1,6 +1,6 @@
 # 0. Set up your environment
 
-Run this page once, in the Code Editor terminal, before the modules.
+Run this page once, before the modules. Step 1 runs in the Code Editor terminal. After it, you can run the rest of this page, and every module, either in the terminal or as a notebook.
 
 ## Prerequisites
 
@@ -10,7 +10,20 @@ Run this page once, in the Code Editor terminal, before the modules.
 - No Hugging Face account or token: every lab uses ungated models
 - Module 6 only: the HyperPod task governance add-on, with the cluster policy and compute allocations from the workshop's task governance section
 
-## Free the GPUs
+## 1. Get the lab files (terminal)
+
+In the Code Editor terminal (**Terminal > New Terminal**), clone this lab's repository and install the Bash kernel for Jupyter (a few seconds):
+
+```bash
+cd ~
+git clone https://github.com/hossam-basudan/sagemaker-hyperpod-inference-dive-deep.git hyperpod-inference-dive-deep
+cd ~/hyperpod-inference-dive-deep
+scripts/install-kernel.sh
+```
+
+To continue in a notebook, open `notebooks/00-setup.ipynb` from the Explorer, select the **Bash** kernel at the top right, and run its cells in order. The kernel is one shell, so variables and functions carry over from cell to cell, as in a terminal. To stay in the terminal, run the commands below there.
+
+## 2. Free the GPUs
 
 Free the GPUs that the earlier inference labs and the training job may still hold. Each command is safe to run when the resource is already gone:
 
@@ -21,18 +34,9 @@ kubectl delete hyperpodpytorchjob --all -n default
 kubectl get pods -n default
 ```
 
-## Prepare the cluster
+## 3. Prepare the cluster
 
-When no model or training pods are left, prepare the cluster. In the Code Editor terminal, clone this lab's repository and run its setup script:
-
-```bash
-cd ~
-git clone https://github.com/hossam-basudan/sagemaker-hyperpod-inference-dive-deep.git hyperpod-inference-dive-deep
-cd ~/hyperpod-inference-dive-deep
-scripts/setup.sh
-```
-
-The script shows what it will create and asks before it changes anything. It takes about 12 minutes and is safe to rerun:
+When no model or training pods are left, run the setup script. It takes about 12 minutes, prints its progress, and is safe to rerun. `-y` skips its confirmation prompt, which a notebook cell can't answer; this is what it does:
 
 | Step | Why |
 |---|---|
@@ -41,8 +45,18 @@ The script shows what it will create and asks before it changes anything. It tak
 | Runs the add-on's controllers and `metrics-server` on the CPU instance group | Leaves the GPU nodes' few pod slots for models |
 | Creates an S3 bucket for model weights (module 2), an ECR repository, and an AWS CodeBuild project (module 3) | The Code Editor can't run Docker, so module 3 builds its image in CodeBuild |
 | Writes `env.sh` | The variables every module uses |
+| Installs the Bash kernel for Jupyter (again, if step 1 did) | The notebooks run in it |
 
-Load the variables. Run this again in every new terminal:
+```bash
+cd ~/hyperpod-inference-dive-deep
+scripts/setup.sh -y
+```
+
+Without `-y`, the script lists the account, cluster, and resource names it will use, and asks before it changes anything.
+
+## 4. Load the variables
+
+Load the variables. Run this again in every new terminal (each module's notebook does it in its first cell):
 
 ```bash
 source ~/hyperpod-inference-dive-deep/env.sh
@@ -56,8 +70,8 @@ You can set the variables by hand instead of running `scripts/setup.sh`. Replace
 
 ```bash
 export REGION=us-west-2
-export EKS_CLUSTER_NAME=<your-eks-cluster-name>
-export HYPERPOD_CLUSTER_NAME=<your-hyperpod-cluster-name>
+export EKS_CLUSTER_NAME="<your-eks-cluster-name>"
+export HYPERPOD_CLUSTER_NAME="<your-hyperpod-cluster-name>"
 
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export HYPERPOD_CLUSTER_ARN=$(aws sagemaker describe-cluster \
@@ -91,10 +105,10 @@ kubectl get nodes -L node.kubernetes.io/instance-type
 
 ## Optional: Prometheus metrics
 
-Module 4's Prometheus trigger and module 5's metrics queries need the HyperPod observability add-on and an Amazon Managed Service for Prometheus workspace. To set them up (about 3 minutes):
+Module 4's Prometheus trigger and module 5's metrics queries need the HyperPod observability add-on and an Amazon Managed Service for Prometheus workspace. To set them up (about 3 minutes; without `-y` the script asks first):
 
 ```bash
-~/hyperpod-inference-dive-deep/scripts/observability.sh
+~/hyperpod-inference-dive-deep/scripts/observability.sh -y
 ```
 
 > [!WARNING]
@@ -103,6 +117,6 @@ Module 4's Prometheus trigger and module 5's metrics queries need the HyperPod o
 > [!NOTE]
 > `kubectl explain` is the source of truth for every field in this section. If a field here differs from your operator version, run `kubectl explain inferenceendpointconfig.spec --recursive` (or `jumpstartmodel.spec`) and trust what your cluster reports.
 
-## Next: run the modules as notebooks
+## Next
 
-`scripts/setup.sh` installed a Bash kernel for Jupyter. Instead of copying commands from the module pages, open [notebooks/01-operator-internals.ipynb](notebooks/01-operator-internals.ipynb) in the Code Editor, select the **Bash** kernel at the top right, and run the cells in order. Each notebook starts by loading `env.sh`.
+Continue with [1. Inference Operator internals](01-operator-internals.md).
