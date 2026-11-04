@@ -79,14 +79,10 @@ else
   done
 fi
 
-log "GPU nodes"
-for n in $(kubectl get nodes -o json | jq -r '.items[] | select(.status.allocatable["nvidia.com/gpu"] != null) | .metadata.name'); do
-  pods=$(kubectl get pods -A --field-selector "spec.nodeName=$n,status.phase!=Succeeded,status.phase!=Failed" --no-headers)
-  echo "$n: $(echo "$pods" | grep -c .) of $(kubectl get node "$n" -o jsonpath='{.status.allocatable.pods}') pods"
-  echo "$pods" | awk '{print $1}' | sort | uniq -c | sed 's/^/    /'
-done
+log "Nodes"
+"$HERE/node-pods.sh"
 cat <<EOF
 
-Done. Each GPU node should now run only system pods (mostly kube-system), plus
-hyperpod-observability if the observability add-on is installed.
+Done. The GPU nodes should now show 0 GPUs requested and only system pods: DaemonSets in
+kube-system and aws-hyperpod, plus hyperpod-observability if that add-on is installed.
 EOF

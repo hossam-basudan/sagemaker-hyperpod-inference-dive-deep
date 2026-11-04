@@ -149,6 +149,9 @@ You're ready for the labs once both checks pass.
 > [!NOTE]
 > If a later lab finds the GPUs taken (a pod stays `Pending` with `Insufficient nvidia.com/gpu`), run `~/hyperpod-inference-dive-deep/scripts/reset-gpus.sh` (add `-y` to skip its confirmation prompt). It lists every model, training job, and cache the labs leave behind, asks before it deletes them, and shows what's left on each GPU node. Afterward, redeploy `tinyllama-dd` from lab 1 if the lab needs it.
 
+> [!NOTE]
+> To see how full each node is at any time, run `~/hyperpod-inference-dive-deep/scripts/node-pods.sh`. It prints each node's pods against its pod limit, its free slots, and the GPUs requested, then lists the pods by namespace and says which are DaemonSet pods (one on every node) and which could run on another node. Add `-s` for one line per node. It changes nothing.
+
 ## Optional: Prometheus metrics
 
 Two parts of later labs read metrics from Prometheus: lab 2's Prometheus trigger and lab 3's metrics queries. They need the HyperPod observability add-on and an Amazon Managed Service for Prometheus workspace. If you skip this step, skip those two parts; the rest of labs 2 and 3 still works.
