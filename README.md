@@ -3,7 +3,7 @@
 This lab continues the [SageMaker HyperPod EKS workshop](https://catalog.us-east-1.prod.workshops.aws/workshops/5344c881-4077-471e-aedf-2944bd6fe8eb/en-US) on the same cluster, after its inference section. Run every command in the workshop's Code Editor.
 
 > [!TIP]
-> Every page, setup included, is also a notebook in [notebooks/](notebooks/), with the same text and commands. Run step 1 of [00-setup.md](00-setup.md) in the terminal (clone and install the Bash kernel), then open `notebooks/00-setup.ipynb` in the Code Editor, select the **Bash** kernel, and run the cells in order instead of copying commands into the terminal.
+> Every page, setup included, is also a notebook in [notebooks/](notebooks/), with the same text and commands. Run step 1 of [00-setup.md](00-setup.md) in the terminal (clone and install the Bash kernel), then open `notebooks/00-setup.ipynb` in the Code Editor, select the **Bash** kernel (**Select Kernel** > **Select Another Kernel...** > **Jupyter Kernel...** > **Bash**), and run the cells in order instead of copying commands into the terminal.
 
 
 The earlier inference labs got a model serving through the HyperPod Inference Operator. This section opens it up: what the operator creates, where model weights come from, how to run your own serving container, and how to scale, observe, and govern inference alongside training on the same cluster.

@@ -21,7 +21,7 @@ cd ~/hyperpod-inference-dive-deep
 scripts/install-kernel.sh
 ```
 
-To continue in a notebook, open `notebooks/00-setup.ipynb` from the Explorer, select the **Bash** kernel at the top right, and run its cells in order. The kernel is one shell, so variables and functions carry over from cell to cell, as in a terminal. To stay in the terminal, run the commands below there.
+To continue in a notebook, open `notebooks/00-setup.ipynb` from the Explorer and select the **Bash** kernel: click **Select Kernel** at the top right (or the kernel name there, such as `base (Python 3.x)`), then **Select Another Kernel...** > **Jupyter Kernel...** > **Bash**. If **Bash** isn't listed, reload the window (Command Palette > **Developer: Reload Window**). Then run the cells in order. The kernel is one shell, so variables and functions carry over from cell to cell, as in a terminal. To stay in the terminal, run the commands below there.
 
 ## 2. Free the GPUs
 
