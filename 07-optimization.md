@@ -177,10 +177,11 @@ Run the commands again every minute or so. The Deployment shows `0/0`. The weigh
 
 ```bash
 kubectl scale deploy/"$ENDPOINT_NAME" -n $NAMESPACE --replicas="$REPLICAS"
-kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o wide -w
+kubectl rollout status deploy/"$ENDPOINT_NAME" -n $NAMESPACE --timeout=10m
+kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o wide
 ```
 
-Each pod is `3/3 Running` within about two minutes. Press `Ctrl-C`, then confirm what the model container started with:
+Each pod is `3/3 Running` within about two minutes. Confirm what the model container started with:
 
 ```bash
 POD=$(kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o jsonpath='{.items[0].metadata.name}')

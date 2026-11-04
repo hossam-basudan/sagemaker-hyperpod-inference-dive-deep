@@ -151,14 +151,20 @@ Three fields deserve attention:
 - **`invocationEndpoint`**: the path after `http://<host>:<port>/` that the ALB and the SageMaker endpoint forward requests to. It defaults to `invocations`. OpenAI-compatible servers need `v1/chat/completions` (or `v1/completions`).
 - **`loadBalancer.healthCheckPath`**: the ALB target-group health check. It defaults to `/ping`, but vLLM answers on `/health`.
 
-Watch the operator work through its states (`DeploymentPending` → `DeploymentInProgress` → `DeploymentComplete`). This takes 5–10 minutes the first time, mostly image pull and ALB provisioning:
+Watch the operator work through its states (`DeploymentPending` → `DeploymentInProgress` → `DeploymentComplete`). This takes 5–10 minutes the first time, mostly image pull and ALB provisioning. The loop prints each change of the operator state and the SageMaker endpoint state, and stops when both are done (or on a failure, or after 20 minutes):
 
 ```bash
-kubectl get inferenceendpointconfig $ENDPOINT_NAME -n $NAMESPACE -w \
-  -o custom-columns='NAME:.metadata.name,STATE:.status.state,SAGEMAKER:.status.endpoints.sagemaker.state'
+LAST=
+for i in $(seq 120); do
+  NOW=$(kubectl get inferenceendpointconfig $ENDPOINT_NAME -n $NAMESPACE --no-headers \
+    -o custom-columns='STATE:.status.state,SAGEMAKER:.status.endpoints.sagemaker.state')
+  [ "$NOW" != "$LAST" ] && echo "$(date +%T)  $NOW" && LAST=$NOW
+  case "$NOW" in *Failed*|*DeploymentComplete*CreationCompleted*) break ;; esac
+  sleep 10
+done
 ```
 
-In a second terminal, list everything the operator created for you:
+List everything the operator created for you:
 
 ```bash
 kubectl get deploy,pods,svc,ingress,sagemakerendpointregistration -n $NAMESPACE | grep -E "NAME|$ENDPOINT_NAME"

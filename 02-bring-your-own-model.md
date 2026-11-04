@@ -71,10 +71,17 @@ kubectl apply -f qwen-hf-pinned.yaml
 
 There is no `endpointName`, so this deployment gets an ALB but no SageMaker AI endpoint. That's fine for internal callers.
 
-Watch the init container download the weights:
+Watch the init container download the weights. The loop prints the pod's status each time it changes and stops when the deployment is complete (or after 20 minutes):
 
 ```bash
-kubectl get pods -n $NAMESPACE -w | grep qwen-hf
+LAST=
+for i in $(seq 120); do
+  NOW=$(kubectl get pods -n $NAMESPACE --no-headers 2>/dev/null | grep qwen-hf | awk '{print $1, $2, $3}')
+  [ "$NOW" != "$LAST" ] && echo "$(date +%T)  $NOW" && LAST=$NOW
+  STATE=$(kubectl get inferenceendpointconfig qwen-hf -n $NAMESPACE -o jsonpath='{.status.state}')
+  case "$STATE" in DeploymentComplete|DeploymentFailed) echo "$STATE"; break ;; esac
+  sleep 10
+done
 ```
 
 **`prefetchEnabled: true` vs `false`**: with `true`, an init container downloads the weights before the server starts, so a failed download fails fast and visibly (`Init:CrashLoopBackOff`). With `false`, the runtime (vLLM, TGI, SGLang) downloads the model itself at startup.
@@ -271,7 +278,13 @@ spec:
     args: ["--model", "/opt/ml/model", "--port", "8000", "--served-model-name", "qwen-fsx"]
 EOF
 kubectl apply -f qwen-fsx.yaml
-kubectl get inferenceendpointconfig qwen-fsx -n $NAMESPACE -w
+LAST=
+for i in $(seq 120); do
+  NOW=$(kubectl get inferenceendpointconfig qwen-fsx -n $NAMESPACE -o jsonpath='{.status.state}')
+  [ "$NOW" != "$LAST" ] && echo "$(date +%T)  $NOW" && LAST=$NOW
+  case "$NOW" in DeploymentComplete|DeploymentFailed) break ;; esac
+  sleep 10
+done
 ```
 
 It reaches `DeploymentComplete` in about 2 minutes, faster than the other sources. There's no init container: the operator mounts the file system as a volume (`inference-fsx-pvc-qwen-fsx`), and vLLM reads the weights in place. Every replica reads the same shared copy, which is why FSx is the fastest way to scale out a large model.
@@ -313,11 +326,17 @@ spec:
   maxDeployTimeInSeconds: 1800
 EOF
 kubectl apply -f deepseek-js.yaml
-kubectl get jumpstartmodel deepseek-js -n $NAMESPACE -w \
-  -o custom-columns='NAME:.metadata.name,STATE:.status.state,SAGEMAKER:.status.endpoints.sagemaker.state'
+LAST=
+for i in $(seq 180); do
+  NOW=$(kubectl get jumpstartmodel deepseek-js -n $NAMESPACE --no-headers \
+    -o custom-columns='STATE:.status.state,SAGEMAKER:.status.endpoints.sagemaker.state')
+  [ "$NOW" != "$LAST" ] && echo "$(date +%T)  $NOW" && LAST=$NOW
+  case "$NOW" in *Failed*|*DeploymentComplete*CreationCompleted*) break ;; esac
+  sleep 10
+done
 ```
 
-When it shows `DeploymentComplete` / `CreationCompleted`, invoke it. JumpStart picked the serving image for you (here LMI on port 8080, with `/ping` health checks), and LMI expects the `inputs`/`parameters` payload:
+The loop prints each state change and stops at `DeploymentComplete` / `CreationCompleted` (or a failure, or after 30 minutes). Then invoke it. JumpStart picked the serving image for you (here LMI on port 8080, with `/ping` health checks), and LMI expects the `inputs`/`parameters` payload:
 
 ```bash
 aws sagemaker-runtime invoke-endpoint --endpoint-name deepseek-js \

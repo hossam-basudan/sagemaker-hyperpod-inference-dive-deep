@@ -97,10 +97,19 @@ export ENDPOINT_NAME REGION
 seq 8 | xargs -P 8 -I{} ./load.sh &
 ```
 
-Watch the replicas react. CloudWatch publishes SageMaker metrics at 1-minute granularity, so expect the first scale-up within 1–3 minutes of load starting:
+Watch the replicas react. CloudWatch publishes SageMaker metrics at 1-minute granularity, so expect the first scale-up within 1–3 minutes of load starting. The loop prints the HPA and the model pods every 20 seconds. It stops once the endpoint has scaled up, the load has ended, and the replica count is back to 1 (or after 15 minutes):
 
 ```bash
-watch -n 10 "kubectl get hpa -n $NAMESPACE; echo; kubectl get pods -n $NAMESPACE | grep $ENDPOINT_NAME"
+SCALED=false
+for i in $(seq 45); do
+  echo "--- $(date +%T)"
+  kubectl get hpa -n $NAMESPACE --no-headers
+  kubectl get pods -n $NAMESPACE --no-headers | grep $ENDPOINT_NAME | awk '{print $1, $2, $3}'
+  R=$(kubectl get deploy $ENDPOINT_NAME -n $NAMESPACE -o jsonpath='{.status.replicas}')
+  [ "${R:-0}" -gt 1 ] && SCALED=true
+  $SCALED && [ "$R" = 1 ] && ! pgrep -f load.sh >/dev/null && break
+  sleep 20
+done
 ```
 
 When the load stops, the replica count returns to 1 after `scaleDownStabilizationTime` plus the metric lag.

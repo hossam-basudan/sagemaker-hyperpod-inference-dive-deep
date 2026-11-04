@@ -192,9 +192,17 @@ spec:
         failureThreshold: 3
 EOF
 kubectl apply -f qwen-byoc.yaml
+LAST=
+for i in $(seq 120); do
+  NOW=$(kubectl get inferenceendpointconfig qwen-byoc -n $NAMESPACE --no-headers \
+    -o custom-columns='STATE:.status.state,SAGEMAKER:.status.endpoints.sagemaker.state')
+  [ "$NOW" != "$LAST" ] && echo "$(date +%T)  $NOW" && LAST=$NOW
+  case "$NOW" in *Failed*|*DeploymentComplete*CreationCompleted*) break ;; esac
+  sleep 10
+done
 ```
 
-Confirm what the entrypoint detected:
+The loop prints each state change and stops when the deployment and the SageMaker endpoint are ready (or on a failure, or after 20 minutes). Confirm what the entrypoint detected:
 
 ```bash
 POD=$(kubectl get pods -n $NAMESPACE -l app=qwen-byoc -o jsonpath='{.items[0].metadata.name}')
@@ -203,7 +211,7 @@ kubectl logs $POD -n $NAMESPACE --all-containers | grep '\[entrypoint\]'
 
 Expected: `[entrypoint] model=/opt/ml/model gpus=1 tp=1 port=8000 name=qwen`
 
-Invoke it through SageMaker once `kubectl get inferenceendpointconfig qwen-byoc -n $NAMESPACE` shows `DeploymentComplete`:
+Invoke it through SageMaker:
 
 ```bash
 aws sagemaker-runtime invoke-endpoint --endpoint-name qwen-byoc \

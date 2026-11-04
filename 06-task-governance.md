@@ -201,10 +201,16 @@ EOF
 kubectl apply -f tinyllama-team-a.yaml
 ```
 
-Watch one of team A's training workloads lose its admission so that inference can run:
+Watch one of team A's training workloads lose its admission so that inference can run. The loop prints team A's workloads and pods every 15 seconds and stops when the inference pod is running (or after 10 minutes):
 
 ```bash
-watch -n 5 "kubectl get workloads -n hyperpod-ns-team-a; echo; kubectl get pods -n hyperpod-ns-team-a"
+for i in $(seq 40); do
+  echo "--- $(date +%T)"
+  kubectl get workloads -n hyperpod-ns-team-a
+  kubectl get pods -n hyperpod-ns-team-a --no-headers | awk '{print $1, $2, $3}'
+  kubectl get pods -n hyperpod-ns-team-a --no-headers | grep tinyllama-team-a | grep -q ' Running ' && break
+  sleep 15
+done
 ```
 
 Ask Kueue why the training job was evicted:
@@ -228,8 +234,15 @@ Team A is still using team B's node. Team B now submits work of its own:
 
 ```bash
 submit_training team-b train-b1
-watch -n 5 "kubectl get workloads -A | grep -E 'NAMESPACE|team-'"
+for i in $(seq 40); do
+  echo "--- $(date +%T)"
+  kubectl get workloads -A | grep -E 'NAMESPACE|team-'
+  kubectl get pods -n hyperpod-ns-team-b --no-headers 2>/dev/null | grep train-b1 | grep -q ' Running ' && break
+  sleep 15
+done
 ```
+
+The loop stops when `train-b1` is running (or after 10 minutes).
 
 Kueue brings team A back within its own quota so team B gets its guaranteed node. Quota is accounting, not node placement, so Kueue doesn't look for "the pod on the borrowed node". It evicts team A's **lowest-priority** workload: `train-a1` goes, and the inference endpoint keeps running. Rerun the condition loop from step 3. This eviction says `due to reclamation within the cohort`, not `due to prioritization in the ClusterQueue`:
 
