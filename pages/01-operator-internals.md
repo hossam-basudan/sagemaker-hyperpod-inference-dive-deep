@@ -272,9 +272,9 @@ kubectl logs -n hyperpod-inference-system $OPERATOR --tail=100 | grep -i $ENDPOI
 |---|---|
 | Operator pod stuck in `Init`; log says `S3 CSI driver not installed` / `FSx CSI driver not installed` / `Missing required CRD: certificaterequests.cert-manager.io` | Install the missing dependency add-on (`aws-mountpoint-s3-csi-driver`, `aws-fsx-csi-driver`, `cert-manager`) |
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Execution role trust policy: OIDC provider or service account `sub` is wrong |
-| Model pod `Pending` with `Insufficient nvidia.com/gpu` | No free GPUs of `instanceType`. Check `kubectl describe node`; under task governance, check `kubectl get workloads` (module 6) |
-| Init container `Init:CrashLoopBackOff` | Weight download failed: Hugging Face token or egress, or S3 permissions (module 2) |
-| Model server restarts during load | Out of GPU memory, or slow startup killed by probes (module 3) |
+| Model pod `Pending` with `Insufficient nvidia.com/gpu` | No free GPUs of `instanceType`. Check `kubectl describe node`; under task governance, check `kubectl get workloads` (module 7) |
+| Init container `Init:CrashLoopBackOff` | Weight download failed: Hugging Face token or egress, or S3 permissions (module 4) |
+| Model server restarts during load | Out of GPU memory, or slow startup killed by probes (module 5) |
 | ALB targets unhealthy | `loadBalancer.healthCheckPath` doesn't match the server, for example `/ping` on vLLM |
 | SageMaker endpoint `Failed`: *did not pass the ping health check*; endpoint logs show `Error downloading CA certificate: Connect timeout on endpoint URL` | The SageMaker endpoint runs in the **EKS cluster subnets** and must reach S3 to fetch its CA certificate. Associate the S3 gateway VPC endpoint with those subnets' route tables (the workshop Terraform does this), then delete and re-create the endpoint |
 | `...sufficient permissions for creating an endpoint variant within a VPC` | Add `ec2:CreateNetworkInterfacePermission` and `ec2:DeleteNetworkInterfacePermission` to the execution role |
@@ -283,4 +283,4 @@ kubectl logs -n hyperpod-inference-system $OPERATOR --tail=100 | grep -i $ENDPOI
 | Imported certificate left in ACM after you delete an endpoint; operator logs show `failed to delete ACM cert ... ResourceInUseException` | The operator tried to delete the certificate while the ALB still used it, and doesn't retry. Once the ALB is gone, delete it with `aws acm delete-certificate`. It's tagged `CreatedBy=HyperPodInference`, and its domain is the old ALB hostname |
 
 > [!NOTE]
-> Keep `tinyllama-dd` running. Modules 4 and 5 use it. To remove it later, run `kubectl delete inferenceendpointconfig tinyllama-dd -n $NAMESPACE`, which also deletes the SageMaker endpoint and the ALB.
+> Keep `tinyllama-dd` running. Modules 2 and 3 use it. To remove it later, run `kubectl delete inferenceendpointconfig tinyllama-dd -n $NAMESPACE`, which also deletes the SageMaker endpoint and the ALB.

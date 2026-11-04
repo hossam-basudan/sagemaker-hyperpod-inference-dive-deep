@@ -1,4 +1,4 @@
-# 4. Autoscaling
+# 2. Autoscaling
 
 Inference traffic is bursty. HyperPod scales inference at two levels:
 
@@ -8,6 +8,18 @@ Inference traffic is bursty. HyperPod scales inference at two levels:
 | Nodes | HyperPod **managed Karpenter** (continuous provisioning) | Instances, when replicas are pending for lack of capacity |
 
 This module covers pod scaling with the `tinyllama-dd` endpoint from module 1. Each replica uses the only GPU on an `ml.g5.2xlarge` node, so with two nodes the endpoint scales from 1 to 2 replicas.
+
+## Free the second GPU
+
+The second replica needs the other GPU node. Right after module 1 it's free. If you ran later modules first and one of their models still runs there, the HPA asks for 2 replicas but the new pod stays `Pending`. Delete those deployments (each command is safe to run when the deployment is already gone), then check that `tinyllama-dd` is the only one left:
+
+```bash
+kubectl delete inferenceendpointconfig qwen-hf qwen-s3 qwen-fsx qwen-byoc -n $NAMESPACE --ignore-not-found
+kubectl delete jumpstartmodel deepseek-js -n $NAMESPACE --ignore-not-found
+kubectl get inferenceendpointconfig,jumpstartmodel -A
+```
+
+Expected: only `tinyllama-dd`, in `DeploymentComplete`. If it's missing, deploy it again from module 1 with `kubectl apply -f tinyllama-dd.yaml`.
 
 ## How the operator scales
 
@@ -114,6 +126,9 @@ done
 
 When the load stops, the replica count returns to 1 after `scaleDownStabilizationTime` plus the metric lag.
 
+> [!WARNING]
+> If `REPLICAS` goes to 2 but the new pod stays `Pending`, the scaling worked and the scheduler has nowhere to put the pod. Run `kubectl describe pod <pending-pod> -n $NAMESPACE` and read the events. `Insufficient nvidia.com/gpu` means another model holds the second GPU (see "Free the second GPU" above). `Too many pods` means the node is at its pod limit; see the pod budget on the overview page. On a cluster with continuous provisioning, Karpenter would add a node instead.
+
 > [!NOTE]
 > If the HPA shows `<unknown>` for the metric, check the KEDA operator logs with `kubectl logs -n hyperpod-inference-system deploy/keda-operator --tail=50`. The usual cause is that the KEDA role is missing `cloudwatch:GetMetricData`, or that the dimensions don't match the endpoint name.
 
@@ -128,7 +143,7 @@ Every `autoScalingSpec` field maps to a KEDA field. You can also skip `autoScali
 
 ## Scale on model-level metrics with Prometheus
 
-Invocations per minute is a coarse signal for LLMs: one request can take 50 ms or 50 s. Concurrency or queue depth tracks load more closely. The operator's reverse-proxy sidecar exports `model_concurrent_requests` (module 5), and the HyperPod observability add-on writes it to Amazon Managed Service for Prometheus.
+Invocations per minute is a coarse signal for LLMs: one request can take 50 ms or 50 s. Concurrency or queue depth tracks load more closely. The operator's reverse-proxy sidecar exports `model_concurrent_requests` (module 3), and the HyperPod observability add-on writes it to Amazon Managed Service for Prometheus.
 
 Read the workspace your cluster's observability add-on writes to. An account often has several workspaces, so don't take the first one `aws amp list-workspaces` returns:
 
@@ -148,7 +163,9 @@ Before you scale on a query, run it. Prometheus queries need SigV4-signed reques
 pip install -q awscurl
 awscurl --service aps --region $REGION -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
   -d 'query=sum by (pod_name) (model_concurrent_requests{resource_name="tinyllama-dd"})' \
-  $AMP_ENDPOINT/api/v1/query | jq -c '[.data.result[] | {pod: .metric.pod_name, value: .value[1]}]'
+  $AMP_ENDPOINT/api/v1/query \
+| jq -r 'if (.data.result | length) == 0 then "  (no data yet)" else .data.result[]
+      | "  \(.metric | del(.__name__) | to_entries | map("\(.key)=\(.value)") | join(" ") | if . == "" then "total" else . end): \(.value[1] | if test("NaN|Inf") then "no traffic" else (tonumber * 100 | round / 100 | tostring) end)" end'
 ```
 
 The value jumps between 0 and 8 from one query to the next: each request in `load.sh` starts a new `aws` process, so the 8 clients spend part of their time between requests. New samples reach the workspace a minute or two after the load starts.
@@ -191,8 +208,8 @@ Set `minReplicaCount: 0` and an `activationTargetValue`. KEDA scales from 0 to 1
 Keep in mind:
 
 - **The activation metric must not come from the pods.** With zero pods, pod metrics such as `model_concurrent_requests`, CPU, or memory are never emitted, so the endpoint can't wake up. Use a metric produced outside the pods, such as SageMaker endpoint invocations or SQS queue depth.
-- **The first requests after idle fail or wait** for scheduling, image pull, and weight load. Make clients retry, or put a queue in front of the endpoint. Image and weights caching (module 2) shortens this.
-- **Freed GPUs return to the cluster**, and task governance can lend them to other teams (module 6).
+- **The first requests after idle fail or wait** for scheduling, image pull, and weight load. Make clients retry, or put a queue in front of the endpoint. Image and weights caching (module 4) shortens this.
+- **Freed GPUs return to the cluster**, and task governance can lend them to other teams (module 7).
 
 ## Node autoscaling
 

@@ -1,4 +1,4 @@
-# 5. Observability
+# 3. Observability
 
 A HyperPod inference endpoint produces signals at four layers. Knowing which layer emits what tells you where to look.
 
@@ -69,19 +69,22 @@ export AMP_ENDPOINT=$(aws eks describe-addon --cluster-name $EKS_CLUSTER_NAME \
   --addon-name amazon-sagemaker-hyperpod-observability --region $REGION \
   --query addon.configurationValues --output text | jq -r '.ampWorkspace.prometheusEndpoint | rtrimstr("/")')
 pip install -q awscurl
-promql() {  # usage: promql '<query>'
+promql() {  # usage: promql '<title>' '<query>': prints the title, then one line per result
+  echo "$1:"
   awscurl --service aps --region $REGION -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
-    -d "query=$1" $AMP_ENDPOINT/api/v1/query | jq -c '[.data.result[] | {labels: .metric | del(.__name__), value: .value[1]}]'
+    -d "query=$2" $AMP_ENDPOINT/api/v1/query \
+  | jq -r 'if (.data.result | length) == 0 then "  (no data yet)" else .data.result[]
+      | "  \(.metric | del(.__name__) | to_entries | map("\(.key)=\(.value)") | join(" ") | if . == "" then "total" else . end): \(.value[1] | if test("NaN|Inf") then "no traffic" else (tonumber * 100 | round / 100 | tostring) end)" end'
 }
 
-promql 'sum(rate(model_invocations_total{resource_name="tinyllama-dd"}[5m]))'          # requests per second
-promql 'histogram_quantile(0.95, sum by (le) (rate(model_latency_milliseconds_bucket{resource_name="tinyllama-dd"}[5m])))'   # p95 latency, ms
-promql 'histogram_quantile(0.5, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{resource_name="tinyllama-dd"}[5m])))'  # median time to first token, s
-promql 'max(vllm:kv_cache_usage_perc{resource_name="tinyllama-dd"})'                     # KV cache in use, 0 to 1
-promql 'max by (hostname) (DCGM_FI_DEV_GPU_UTIL)'                                         # GPU utilization per node, %
+promql 'Requests per second' 'sum(rate(model_invocations_total{resource_name="tinyllama-dd"}[5m]))'
+promql 'p95 latency (ms)' 'histogram_quantile(0.95, sum by (le) (rate(model_latency_milliseconds_bucket{resource_name="tinyllama-dd"}[5m])))'
+promql 'Median time to first token (s)' 'histogram_quantile(0.5, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{resource_name="tinyllama-dd"}[5m])))'
+promql 'KV cache in use (0 to 1)' 'max(vllm:kv_cache_usage_perc{resource_name="tinyllama-dd"})'
+promql 'GPU utilization per node (%)' 'max by (hostname) (DCGM_FI_DEV_GPU_UTIL)'
 ```
 
-Rerun the load generator from module 4 and query again: request rate, latency, and GPU utilization climb. Prometheus queries are SigV4-signed HTTP calls, which `awscurl` signs with your credentials. The `-X POST` form keeps PromQL's braces and quotes out of the URL.
+Rerun the load generator from module 2 and query again: request rate, latency, and GPU utilization climb. Prometheus queries are SigV4-signed HTTP calls, which `awscurl` signs with your credentials. The `-X POST` form keeps PromQL's braces and quotes out of the URL.
 
 </details>
 
@@ -90,7 +93,7 @@ Rerun the load generator from module 4 and query again: request rate, latency, a
 
 1. In the SageMaker AI console, open **HyperPod clusters**, select your cluster, and install observability from the **Dashboard** tab. Grafana needs IAM Identity Center in the account.
 2. Open the Grafana workspace link, then **Dashboards** → **Inference**.
-3. Filter to `tinyllama-dd` and run the load generator from module 4 with the autoscaling spec applied. You'll see request rate and concurrency climb, then replicas follow.
+3. Filter to `tinyllama-dd` and run the load generator from module 2 with the autoscaling spec applied. You'll see request rate and concurrency climb, then replicas follow.
 
 You can also open the dashboards with the HyperPod CLI: `hyp observability view`.
 
@@ -156,19 +159,33 @@ kubectl rollout status deployment/$ENDPOINT_NAME -n $NAMESPACE --timeout=10m
 
 ## Endpoint metrics in CloudWatch
 
-List what CloudWatch has for your SageMaker AI endpoint (`Invocations`, `ModelLatency`, `OverheadLatency`, `Invocation4XXErrors`, `Invocation5XXErrors`, `InvocationModelErrors`, `ConcurrentRequestsPerModel`, and more), then read the invocation count from the module 4 load test:
+List the metrics CloudWatch has for your SageMaker AI endpoint:
 
 ```bash
+echo "CloudWatch metrics for $ENDPOINT_NAME:"
 aws cloudwatch list-metrics --namespace AWS/SageMaker \
   --dimensions Name=EndpointName,Value=$ENDPOINT_NAME --region $REGION \
-  --query 'Metrics[].MetricName' --output text | tr '\t' '\n' | sort -u
+  --query 'Metrics[].MetricName' --output text | tr '\t' '\n' | sort -u | sed 's/^/  /'
+```
 
+Expected: `Invocations`, `ModelLatency`, `OverheadLatency`, `Invocation4XXErrors`, `Invocation5XXErrors`, `InvocationModelErrors`, `ConcurrentRequestsPerModel`, and a few more.
+
+Read the invocations per minute over the last hour. The command prints only the minutes with traffic, each with a bar (one `#` per 5 requests), then a total:
+
+```bash
 aws cloudwatch get-metric-statistics --namespace AWS/SageMaker --metric-name Invocations \
   --dimensions Name=EndpointName,Value=$ENDPOINT_NAME Name=VariantName,Value=AllTraffic \
   --start-time $(date -u -d '-1 hour' +%FT%TZ 2>/dev/null || date -u -v-1H +%FT%TZ) \
-  --end-time $(date -u +%FT%TZ) --period 60 --statistics Sum --region $REGION \
-  --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Sum]' --output text
+  --end-time $(date -u +%FT%TZ) --period 60 --statistics Sum --region $REGION --output json \
+| jq -r '[.Datapoints[] | select(.Sum > 0)] | sort_by(.Timestamp)
+    | if length == 0 then "No invocations in the last hour: run the load test from module 2 first."
+      else "UTC    REQUESTS",
+           (.[] | "\(.Timestamp[11:16])  \(.Sum | floor | tostring | " " * (8 - length) + .)  \("#" * ((.Sum / 5) | ceil))"),
+           "Total: \(map(.Sum) | add | floor) requests in \(length) minutes, peak \(map(.Sum) | max | floor) per minute"
+      end'
 ```
+
+The load test shows as a block of busy minutes, about 70 requests per minute from 8 parallel clients.
 
 ## Operator logs in CloudWatch Logs
 
@@ -187,10 +204,13 @@ diff <(echo "$CURRENT" | jq -S .) <(jq -S . addon-config-logging.json) || true  
 
 aws eks update-addon --cluster-name $EKS_CLUSTER_NAME \
   --addon-name amazon-sagemaker-hyperpod-inference --region $REGION \
-  --configuration-values file://addon-config-logging.json
+  --configuration-values file://addon-config-logging.json --query update.status --output text \
+  | sed 's/^/update: /'
+aws eks wait addon-active --cluster-name $EKS_CLUSTER_NAME \
+  --addon-name amazon-sagemaker-hyperpod-inference --region $REGION && echo "add-on: ACTIVE"
 ```
 
-Once the add-on returns to `ACTIVE`:
+Then find the operator's log group:
 
 ```bash
 aws logs describe-log-groups --log-group-name-prefix /aws/hyperpod/ --region $REGION \

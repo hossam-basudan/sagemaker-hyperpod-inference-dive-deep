@@ -1,4 +1,4 @@
-# 7. Optimize: tiered KV cache, routing, and model caching
+# 6. Optimize: tiered KV cache, routing, and model caching
 
 A plain deployment recomputes every prompt from scratch unless the exact prefix is still in GPU memory, sends each request to whichever replica the load balancer picks, and starts every new pod by reading the weights from S3 and pulling a 9 GB image. The inference operator has three features that address each of these, all set on the same `InferenceEndpointConfig`:
 
@@ -9,7 +9,7 @@ A plain deployment recomputes every prompt from scratch unless the exact prefix 
 In this module you turn on the cluster's tiered storage, deploy an optimized endpoint, measure the L1 cache with a workload that revisits long prompts, look at how the router keeps prefixes on one replica, and show that a prefix in L2 survives a restart of the model server.
 
 > [!NOTE]
-> Budget about 40 minutes, most of it waiting for the caches and the endpoint. The module uses both GPUs and the model weights you staged in S3 in module 2. It also needs pod slots: up to four more pods on each GPU node (the model, the tiered storage daemon, the image cache, and the router) and three on the CPU node. Step 1 checks them.
+> Budget about 40 minutes, most of it waiting for the caches and the endpoint. The module uses both GPUs and the model weights you staged in S3 in module 4. It also needs pod slots: up to four more pods on each GPU node (the model, the tiered storage daemon, the image cache, and the router) and three on the CPU node. Step 1 checks them.
 
 ## Step 1: Set your environment
 
@@ -26,7 +26,7 @@ export REPLICAS=$(kubectl get nodes -l node.kubernetes.io/instance-type="$INSTAN
 echo "$INSTANCE_TYPE cpu=$MODEL_CPU memory=$MODEL_MEMORY replicas=$REPLICAS"
 
 aws s3 ls s3://$MODEL_BUCKET/$MODEL_PREFIX/config.json --region $REGION >/dev/null \
-  && echo "weights staged" || echo "Stage the weights first: module 2, Amazon S3 lab"
+  && echo "weights staged" || echo "Stage the weights first: module 4, Amazon S3 lab"
 kubectl get inferenceendpointconfig,jumpstartmodel -A
 ```
 
@@ -37,18 +37,41 @@ Check that every node has room for this module's pods. HyperPod limits pods per 
 ```bash
 for n in $(kubectl get nodes -o name | cut -d/ -f2); do
   cap=$(kubectl get node $n -o jsonpath='{.status.allocatable.pods}')
-  used=$(kubectl get pods -A --field-selector spec.nodeName=$n,status.phase!=Succeeded,status.phase!=Failed --no-headers | wc -l | tr -d ' ')
+  pods=$(kubectl get pods -A --field-selector spec.nodeName=$n,status.phase!=Succeeded,status.phase!=Failed --no-headers)
+  used=$(echo "$pods" | grep -c .)
   gpu=$(kubectl get node $n -o jsonpath='{.status.allocatable.nvidia\.com/gpu}')
   need=$([ -n "$gpu" ] && echo 4 || echo 3)
   echo "$n $([ -n "$gpu" ] && echo GPU || echo CPU): $used of $cap pods, $((cap - used)) free, needs $need: $([ $((cap - used)) -ge $need ] && echo OK || echo 'NOT ENOUGH')"
+  if [ $((cap - used)) -lt $need ]; then   # show what fills the node, by namespace
+    echo "$pods" | awk '{print $1}' | sort | uniq -c | sort -rn | sed 's/^/    /'
+  fi
 done
 ```
 
-If a node shows `NOT ENOUGH`, free slots and run the check again:
+If a node shows `NOT ENOUGH`, the list under it shows what fills it. About 7 pods per node in `kube-system` are system DaemonSets that always stay. Free the rest:
 
-- Remove the optional observability add-on, which runs three to six pods on a GPU node: `~/hyperpod-inference-dive-deep/scripts/observability.sh --remove`. Modules 4 and 5 are the only ones that use it.
-- Rerun `~/hyperpod-inference-dive-deep/scripts/setup.sh`. It moves the controllers it can to the CPU node and deletes the workshop's training-image pre-pull DaemonSet.
-- Delete leftover deployments and jobs: `kubectl get pods -A -o wide` shows what runs on each node.
+| Namespace in the list | What it is | Fix |
+|---|---|---|
+| `default` | Models left by earlier modules, including `tinyllama-dd` | Delete them (first command below) |
+| `hyperpod-observability` | The optional observability add-on: 3 to 6 pods per node. Only modules 2 and 3 use it | Remove it (second command below). This also deletes the Prometheus workspace and its metrics |
+| `hyperpod-inference-system`, other controllers | Controllers that can run on the CPU node | Rerun setup (third command below) |
+
+Each command is safe to run when there's nothing to remove:
+
+```bash
+kubectl delete inferenceendpointconfig tinyllama-dd qwen-hf qwen-s3 qwen-fsx qwen-byoc -n $NAMESPACE --ignore-not-found
+kubectl delete jumpstartmodel deepseek-js -n $NAMESPACE --ignore-not-found
+```
+
+```bash
+~/hyperpod-inference-dive-deep/scripts/observability.sh --remove -y
+```
+
+```bash
+~/hyperpod-inference-dive-deep/scripts/setup.sh -y
+```
+
+Then run the check again until every node shows `OK`.
 
 ## Step 2: Turn on the cluster's tiered storage
 
@@ -56,8 +79,9 @@ The L2 tier needs a cache service on the nodes, and HyperPod provides one: **man
 
 ```bash
 aws sagemaker update-cluster --cluster-name "$HYPERPOD_CLUSTER_NAME" --region $REGION \
-  --tiered-storage-config Mode=Enable,InstanceMemoryAllocationPercentage=20
-aws sagemaker describe-cluster --cluster-name "$HYPERPOD_CLUSTER_NAME" --region $REGION --query TieredStorageConfig
+  --tiered-storage-config Mode=Enable,InstanceMemoryAllocationPercentage=20 >/dev/null && echo "update requested"
+aws sagemaker describe-cluster --cluster-name "$HYPERPOD_CLUSTER_NAME" --region $REGION \
+  --query TieredStorageConfig --output table
 ```
 
 The update completes in seconds. Within about a minute, HyperPod starts the daemon, `ai-toolkit`, on every node:
@@ -388,7 +412,8 @@ L2 admits data the way a modern cache does: a block written once and not read ag
 ```bash
 kubectl delete inferenceendpointconfig "$ENDPOINT_NAME" -n $NAMESPACE
 until ! aws sagemaker describe-endpoint --endpoint-name "$ENDPOINT_NAME" --region $REGION >/dev/null 2>&1; do sleep 10; done
-aws sagemaker update-cluster --cluster-name "$HYPERPOD_CLUSTER_NAME" --region $REGION --tiered-storage-config Mode=Disable
+aws sagemaker update-cluster --cluster-name "$HYPERPOD_CLUSTER_NAME" --region $REGION \
+  --tiered-storage-config Mode=Disable >/dev/null && echo "tiered storage: disable requested"
 ```
 
 Disabling tiered storage removes the `ai-toolkit` daemons and returns the 20% of node memory.

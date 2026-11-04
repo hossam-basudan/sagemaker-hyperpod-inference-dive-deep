@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Optional, for module 4's Prometheus trigger and module 5's metrics in Prometheus:
+# Optional, for module 2's Prometheus trigger and module 3's metrics in Prometheus:
 # creates an Amazon Managed Service for Prometheus workspace and installs the HyperPod observability
 # EKS add-on that scrapes the cluster into it. No Grafana: Workshop Studio accounts can't use
 # IAM Identity Center, which Amazon Managed Grafana needs for sign-in.
 # Safe to rerun. Run scripts/setup.sh first.
 # Usage: scripts/observability.sh [-y]            install
-#        scripts/observability.sh --remove [-y]   uninstall the add-on, workspace, and role (before module 7,
+#        scripts/observability.sh --remove [-y]   uninstall the add-on, workspace, and role (before module 6,
 #                                                 whose pods need the 3 slots per node the add-on uses)
 set -euo pipefail
 

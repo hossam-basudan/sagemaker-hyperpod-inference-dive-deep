@@ -1,4 +1,4 @@
-# 2. Bring your own model
+# 4. Bring your own model
 
 `spec.modelSourceConfig` tells the operator where the weights live. The model server always sees them at `worker.modelVolumeMount.mountPath` (default `/opt/ml/model`). Only how they get there changes.
 
@@ -84,6 +84,20 @@ for i in $(seq 120); do
 done
 ```
 
+Test the model. Without a SageMaker endpoint, call the pod directly: forward its port to the Code Editor and send an OpenAI-style request. `model` is the `--served-model-name` from the deployment:
+
+```bash
+POD=$(kubectl get pods -n $NAMESPACE -l app=qwen-hf -o jsonpath='{.items[0].metadata.name}')
+kubectl port-forward pod/$POD 8000:8000 -n $NAMESPACE >/dev/null & PF=$!
+for i in $(seq 30); do curl -s -o /dev/null localhost:8000/health && break; sleep 1; done
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen",
+  "messages": [{"role": "user", "content": "What is Amazon SageMaker HyperPod? Answer in two sentences."}],
+  "max_tokens": 64
+}' | jq -r '.choices[0].message.content'
+kill $PF
+```
+
 **`prefetchEnabled: true` vs `false`**: with `true`, an init container downloads the weights before the server starts, so a failed download fails fast and visibly (`Init:CrashLoopBackOff`). With `false`, the runtime (vLLM, TGI, SGLang) downloads the model itself at startup.
 
 ### Hugging Face download errors
@@ -130,9 +144,11 @@ export MODEL_BUCKET=hyperpod-models-${ACCOUNT_ID}-${REGION}
 aws s3 mb s3://$MODEL_BUCKET --region $REGION 2>/dev/null || true
 
 pip install -q -U huggingface_hub   # includes the `hf` CLI
-hf download Qwen/Qwen2.5-1.5B-Instruct --local-dir ./qwen2.5-1.5b
-aws s3 sync ./qwen2.5-1.5b s3://$MODEL_BUCKET/qwen2.5-1.5b/ --exclude ".cache/*"
-aws s3 ls s3://$MODEL_BUCKET/qwen2.5-1.5b/
+HF_HUB_DISABLE_PROGRESS_BARS=1 hf download Qwen/Qwen2.5-1.5B-Instruct --local-dir ./qwen2.5-1.5b >/dev/null \
+  && echo "downloaded to ./qwen2.5-1.5b"
+aws s3 sync ./qwen2.5-1.5b s3://$MODEL_BUCKET/qwen2.5-1.5b/ --exclude ".cache/*" --only-show-errors \
+  && echo "uploaded to s3://$MODEL_BUCKET/qwen2.5-1.5b/"
+aws s3 ls s3://$MODEL_BUCKET/qwen2.5-1.5b/ --human-readable --summarize
 ```
 
 The **Mountpoint for S3 CSI driver's IAM role** reads the bucket. The operator's execution role does not. Find that role and make sure it allows `s3:ListBucket` on the bucket and `s3:GetObject` on its objects:
@@ -192,11 +208,47 @@ kubectl apply -f qwen-s3.yaml
 
 `bucketName` is the bare bucket name, without `s3://`.
 
+Wait for the deployment. The init container copies the weights from S3 first, so this takes a few minutes:
+
+```bash
+LAST=
+for i in $(seq 120); do
+  NOW=$(kubectl get inferenceendpointconfig qwen-s3 -n $NAMESPACE -o jsonpath='{.status.state}')
+  [ "$NOW" != "$LAST" ] && echo "$(date +%T)  $NOW" && LAST=$NOW
+  case "$NOW" in DeploymentComplete|DeploymentFailed) break ;; esac
+  sleep 10
+done
+```
+
+Test the model the same way:
+
+```bash
+POD=$(kubectl get pods -n $NAMESPACE -l app=qwen-s3 -o jsonpath='{.items[0].metadata.name}')
+kubectl port-forward pod/$POD 8000:8000 -n $NAMESPACE >/dev/null & PF=$!
+for i in $(seq 30); do curl -s -o /dev/null localhost:8000/health && break; sleep 1; done
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen-s3",
+  "messages": [{"role": "user", "content": "Explain in two sentences why you would serve model weights from Amazon S3."}],
+  "max_tokens": 64
+}' | jq -r '.choices[0].message.content'
+kill $PF
+```
+
 With `prefetchEnabled: true`, the operator mounts the bucket through the S3 CSI driver as a PersistentVolumeClaim (`inference-s3-pvc-<name>-inf`), and an init container (`prefetch-<name>-inf`) copies the weights to the pod's local disk before vLLM starts. Unlike the Hugging Face downloader, this init container uses its own Amazon Linux image, not your `worker.image`.
 
 ## FSx for Lustre
 
-If your training jobs already write checkpoints to FSx for Lustre, serve them in place. The workshop cluster mounts its file system through the `fsx-claim` volume in the `default` namespace, the same one the training labs use.
+If your training jobs already write checkpoints to FSx for Lustre, serve them in place. The workshop cluster mounts its file system through the `fsx-pv` volume and the `fsx-claim` claim in the `default` namespace, the same ones the training labs use. Check that your cluster has them:
+
+```bash
+if kubectl get pv fsx-pv >/dev/null 2>&1 && kubectl get pvc fsx-claim -n $NAMESPACE >/dev/null 2>&1; then
+  echo "FSx volume found: run this lab"
+else
+  echo "No FSx volume (fsx-pv, fsx-claim) on this cluster: skip to SageMaker JumpStart below"
+fi
+```
+
+If the check says to skip, go to "SageMaker JumpStart". It frees the GPU from the S3 lab itself.
 
 Free the GPU used by the S3 lab first:
 
@@ -289,6 +341,20 @@ done
 
 It reaches `DeploymentComplete` in about 2 minutes, faster than the other sources. There's no init container: the operator mounts the file system as a volume (`inference-fsx-pvc-qwen-fsx`), and vLLM reads the weights in place. Every replica reads the same shared copy, which is why FSx is the fastest way to scale out a large model.
 
+Test the model:
+
+```bash
+POD=$(kubectl get pods -n $NAMESPACE -l app=qwen-fsx -o jsonpath='{.items[0].metadata.name}')
+kubectl port-forward pod/$POD 8000:8000 -n $NAMESPACE >/dev/null & PF=$!
+for i in $(seq 30); do curl -s -o /dev/null localhost:8000/health && break; sleep 1; done
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen-fsx",
+  "messages": [{"role": "user", "content": "Explain in two sentences what FSx for Lustre is."}],
+  "max_tokens": 64
+}' | jq -r '.choices[0].message.content'
+kill $PF
+```
+
 ## SageMaker JumpStart
 
 `JumpStartModel` is a separate kind. You name a model from the JumpStart hub, and the operator picks the tested image, weights, and server settings. There's no `worker` block.
@@ -299,10 +365,10 @@ aws sagemaker list-hub-contents --hub-name SageMakerPublicHub --hub-content-type
   --query 'HubContentSummaries[].[HubContentName,HubContentVersion]' --output table
 ```
 
-Free the GPU used by the FSx lab first:
+Free the GPU used by the FSx lab (or the S3 lab, if you skipped FSx) first:
 
 ```bash
-kubectl delete inferenceendpointconfig qwen-fsx -n $NAMESPACE --ignore-not-found
+kubectl delete inferenceendpointconfig qwen-s3 qwen-fsx -n $NAMESPACE --ignore-not-found
 ```
 
 ```bash

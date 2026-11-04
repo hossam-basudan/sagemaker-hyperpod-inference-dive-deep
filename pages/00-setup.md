@@ -8,7 +8,7 @@ Run this page once, before the modules. Step 1 runs in the Code Editor terminal.
 - The **`amazon-sagemaker-hyperpod-inference`** EKS add-on. `scripts/setup.sh` installs it (see below)
 - `kubectl`, `aws` CLI v2, `jq`, and `helm` in your terminal. The workshop's Code Editor has all four
 - No Hugging Face account or token: every lab uses ungated models
-- Module 6 only: the HyperPod task governance add-on, with the cluster policy and compute allocations from the workshop's task governance section
+- Module 7 (optional) only: HyperPod task governance with two team allocations. The workshop's task governance section sets it up; if you skipped that section, module 7 sets it up for you
 
 ## 1. Get the lab files (terminal)
 
@@ -43,7 +43,7 @@ When no model or training pods are left, run the setup script. It takes about 12
 | Replaces a Helm-installed inference operator with the `amazon-sagemaker-hyperpod-inference` EKS add-on (operator v3.7) | The workshop cluster runs operator v2.2, which can't load models from Hugging Face and has no request limits or caching. The Helm release owns the operator's CRDs, so the script stops if any inference deployment still exists |
 | Creates the add-on's IAM roles and an S3 bucket for TLS certificates | The add-on requires them. The operator only uses buckets whose names start with `hyperpod-tls` |
 | Runs the add-on's controllers and `metrics-server` on the CPU instance group | Leaves the GPU nodes' few pod slots for models |
-| Creates an S3 bucket for model weights (module 2), an ECR repository, and an AWS CodeBuild project (module 3) | The Code Editor can't run Docker, so module 3 builds its image in CodeBuild |
+| Creates an S3 bucket for model weights (module 4), an ECR repository, and an AWS CodeBuild project (module 5) | The Code Editor can't run Docker, so module 5 builds its image in CodeBuild |
 | Writes `env.sh` | The variables every module uses |
 | Installs the Bash kernel for Jupyter (again, if step 1 did) | The notebooks run in it |
 
@@ -66,7 +66,7 @@ env | grep -E 'REGION|CLUSTER|ACCOUNT_ID|INSTANCE_TYPE|NAMESPACE|TLS_BUCKET|EXEC
 <details>
 <summary><b>Using a cluster that already runs the add-on?</b></summary>
 
-You can set the variables by hand instead of running `scripts/setup.sh`. Replace the two placeholders. Modules 2 and 3 also need the model bucket, the ECR repository, and (without Docker) the CodeBuild project the script creates.
+You can set the variables by hand instead of running `scripts/setup.sh`. Replace the two placeholders. Modules 4 and 5 also need the model bucket, the ECR repository, and (without Docker) the CodeBuild project the script creates.
 
 ```bash
 export REGION=us-west-2
@@ -105,7 +105,7 @@ kubectl get nodes -L node.kubernetes.io/instance-type
 
 ## Optional: Prometheus metrics
 
-Module 4's Prometheus trigger and module 5's metrics queries need the HyperPod observability add-on and an Amazon Managed Service for Prometheus workspace. To set them up (about 3 minutes; without `-y` the script asks first):
+Module 2's Prometheus trigger and module 3's metrics queries need the HyperPod observability add-on and an Amazon Managed Service for Prometheus workspace. To set them up (about 3 minutes; without `-y` the script asks first):
 
 ```bash
 ~/hyperpod-inference-dive-deep/scripts/observability.sh -y

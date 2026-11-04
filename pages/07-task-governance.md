@@ -1,69 +1,95 @@
-# 6. Task governance for inference
+# 7. Task governance for inference (optional)
 
-On a shared HyperPod cluster, inference and training compete for the same GPUs. HyperPod task governance (Kueue) decides who gets them: each team has a guaranteed quota, can borrow idle capacity, and higher-priority work can preempt lower-priority work. Inference endpoints take part in this just like training jobs do.
+This module is optional: run it if your inference shares a cluster with training. On a shared HyperPod cluster, inference and training compete for the same GPUs. HyperPod task governance (Kueue) decides who gets them: each team has a guaranteed quota, can borrow idle capacity, and higher-priority work can preempt lower-priority work. Inference endpoints take part in this just like training jobs do.
 
 ## Prerequisites
 
-This module uses the setup from the workshop's task governance section, sized for two `ml.g5.2xlarge` nodes:
+This module needs task governance set up for two `ml.g5.2xlarge` nodes:
 
-- the HyperPod task governance add-on, with namespaces `hyperpod-ns-team-a` and `hyperpod-ns-team-b`
+- the HyperPod task governance add-on (it installs Kueue)
 - a cluster policy with priority classes `inference` (weight 90), `experimentation` (80), `training` (70), and `fine-tuning` (50)
-- one compute allocation per team: **1 x `ml.g5.2xlarge`**, `LendAndBorrow` with `BorrowLimit=100`, and `PreemptTeamTasks=LowerPriority`
+- one compute allocation per team, `team-a` and `team-b`: **1 x `ml.g5.2xlarge`**, `LendAndBorrow` with `BorrowLimit=100`, and `PreemptTeamTasks=LowerPriority`. The allocations create the namespaces `hyperpod-ns-team-a` and `hyperpod-ns-team-b`
 
-Check what your cluster has:
+The workshop's task governance section sets up exactly this. Check what your cluster has:
 
 ```bash
-aws sagemaker list-compute-quotas --region $REGION --cluster-arn "$HYPERPOD_CLUSTER_ARN" \
-  --query 'ComputeQuotaSummaries[].[Name,ComputeQuotaTarget.TeamName,Status]' --output table
-kubectl get workloadpriorityclass
+echo "Task governance add-on: $(aws eks describe-addon --cluster-name $EKS_CLUSTER_NAME \
+  --addon-name amazon-sagemaker-hyperpod-taskgovernance --region $REGION \
+  --query addon.status --output text 2>/dev/null || echo 'not installed')"
+echo "Cluster policy:"
+aws sagemaker list-cluster-scheduler-configs --cluster-arn "$HYPERPOD_CLUSTER_ARN" --region $REGION \
+  --query 'ClusterSchedulerConfigSummaries[].[Name,Status]' --output text | sed 's/^/  /' | grep . || echo "  none"
+echo "Compute allocations:"
+aws sagemaker list-compute-quotas --cluster-arn "$HYPERPOD_CLUSTER_ARN" --region $REGION \
+  --query 'ComputeQuotaSummaries[].[ComputeQuotaTarget.TeamName,Name,Status]' --output text | sed 's/^/  /' | grep . || echo "  none"
+echo "Priority classes:"
+kubectl get workloadpriorityclass --no-headers 2>/dev/null | awk '{print "  " $1 " (weight " $2 ")"}' | grep . || echo "  none"
 ```
 
-> [!NOTE]
-> If you completed the workshop's task governance section, the cluster policy and both allocations already match this list. Skip to "Free both GPUs".
+If the add-on is `ACTIVE`, there's a cluster policy, both teams have an allocation, and the priority classes include `inference-priority` and `training-priority`, skip to "Free both GPUs". Otherwise, set up what's missing. Each command below skips what already exists.
 
-<details open>
-<summary><b>Create the allocations</b></summary>
-
-Install the add-on and create the cluster policy as in the task governance section first. Then:
+Install the add-on (about 2 minutes):
 
 ```bash
+if ! aws eks describe-addon --cluster-name $EKS_CLUSTER_NAME --addon-name amazon-sagemaker-hyperpod-taskgovernance \
+     --region $REGION >/dev/null 2>&1; then
+  aws eks create-addon --cluster-name $EKS_CLUSTER_NAME --addon-name amazon-sagemaker-hyperpod-taskgovernance \
+    --region $REGION >/dev/null && echo "installing the task governance add-on"
+fi
+aws eks wait addon-active --cluster-name $EKS_CLUSTER_NAME --addon-name amazon-sagemaker-hyperpod-taskgovernance \
+  --region $REGION && echo "task governance add-on: ACTIVE"
+```
+
+Create the cluster policy, which defines the priority classes:
+
+```bash
+if aws sagemaker list-cluster-scheduler-configs --cluster-arn "$HYPERPOD_CLUSTER_ARN" --region $REGION \
+     --query 'ClusterSchedulerConfigSummaries[0].Name' --output text | grep -qv None; then
+  echo "cluster policy: already exists"
+else
+  aws sagemaker create-cluster-scheduler-config --name dive-deep-policy --cluster-arn "$HYPERPOD_CLUSTER_ARN" \
+    --scheduler-config "PriorityClasses=[{Name=inference,Weight=90},{Name=experimentation,Weight=80},{Name=training,Weight=70},{Name=fine-tuning,Weight=50}],FairShare=Enabled" \
+    --region $REGION --query ClusterSchedulerConfigId --output text | sed 's/^/created cluster policy /'
+fi
+```
+
+Create or update one allocation per team:
+
+```bash
+CONFIG="ComputeQuotaResources=[{InstanceType=ml.g5.2xlarge,Count=1}],ResourceSharingConfig={Strategy=LendAndBorrow,BorrowLimit=100},PreemptTeamTasks=LowerPriority"
 for TEAM in team-a team-b; do
-  aws sagemaker create-compute-quota --region $REGION \
-    --name "${TEAM}-g5-2xl" \
-    --cluster-arn "$HYPERPOD_CLUSTER_ARN" \
-    --compute-quota-config "ComputeQuotaResources=[{InstanceType=ml.g5.2xlarge,Count=1}],ResourceSharingConfig={Strategy=LendAndBorrow,BorrowLimit=100},PreemptTeamTasks=LowerPriority" \
-    --activation-state Enabled \
-    --compute-quota-target "TeamName=${TEAM},FairShareWeight=100"
+  read -r ID VERSION <<<"$(aws sagemaker list-compute-quotas --cluster-arn "$HYPERPOD_CLUSTER_ARN" --region $REGION \
+    --query "ComputeQuotaSummaries[?ComputeQuotaTarget.TeamName=='$TEAM'] | [0].[ComputeQuotaId,ComputeQuotaVersion]" --output text)"
+  if [ -z "$ID" ] || [ "$ID" = None ]; then
+    aws sagemaker create-compute-quota --name "${TEAM}-g5-2xl" --cluster-arn "$HYPERPOD_CLUSTER_ARN" --region $REGION \
+      --compute-quota-config "$CONFIG" --activation-state Enabled \
+      --compute-quota-target "TeamName=${TEAM},FairShareWeight=100" \
+      --query ComputeQuotaId --output text | sed "s/^/${TEAM}: created allocation /"
+  else
+    aws sagemaker update-compute-quota --compute-quota-id "$ID" --target-version "$VERSION" --region $REGION \
+      --compute-quota-config "$CONFIG" --query ComputeQuotaId --output text | sed "s/^/${TEAM}: updated allocation /"
+  fi
 done
 ```
 
-`ComputeQuota record already exists` means the team already has an allocation.
+`BorrowLimit` is a percentage of the team's own quota. With a one-node quota, `BorrowLimit=50` would allow half a GPU, which can't hold a pod, so this module needs 100.
 
-</details>
-
-<details>
-<summary><b>Update existing allocations</b></summary>
-
-If your allocations use a different instance type or a lower `BorrowLimit`, update them:
+Wait for the team namespaces and queues, then run the check above again:
 
 ```bash
-aws sagemaker list-compute-quotas --region $REGION --cluster-arn "$HYPERPOD_CLUSTER_ARN" \
-  --query 'ComputeQuotaSummaries[].[ComputeQuotaId,Name,ComputeQuotaVersion,ComputeQuotaTarget.TeamName]' --output table
-
-aws sagemaker update-compute-quota --region $REGION \
-  --compute-quota-id <id> --target-version <version> \
-  --compute-quota-config "ComputeQuotaResources=[{InstanceType=ml.g5.2xlarge,Count=1}],ResourceSharingConfig={Strategy=LendAndBorrow,BorrowLimit=100},PreemptTeamTasks=LowerPriority"
+for i in $(seq 30); do
+  kubectl get localqueue -n hyperpod-ns-team-a --no-headers 2>/dev/null | grep -q . \
+    && kubectl get localqueue -n hyperpod-ns-team-b --no-headers 2>/dev/null | grep -q . && break
+  sleep 10
+done
+kubectl get localqueue -A
 ```
-
-</details>
-
-
-`BorrowLimit` is a percentage of the team's own quota. With a one-node quota, `BorrowLimit=50` would allow half a GPU, which can't hold a pod, so this module needs 100.
 
 Free both GPUs before you start:
 
 ```bash
-kubectl delete inferenceendpointconfig tinyllama-dd -n $NAMESPACE --ignore-not-found
+kubectl delete inferenceendpointconfig tinyllama-dd qwen-opt qwen-hf qwen-s3 qwen-fsx qwen-byoc -n $NAMESPACE --ignore-not-found
+kubectl delete jumpstartmodel deepseek-js -n $NAMESPACE --ignore-not-found
 kubectl get pods -A | grep -E 'tinyllama|qwen|deepseek' || echo "GPUs free"
 ```
 

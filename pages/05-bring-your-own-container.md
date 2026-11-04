@@ -1,4 +1,4 @@
-# 3. Bring your own container
+# 5. Bring your own container
 
 `worker.image` can be any image that serves HTTP. The operator doesn't care what's inside, as long as the container honors a small contract.
 
@@ -134,7 +134,10 @@ The HyperPod nodes pull the image with the instance group's execution role. That
 
 ### 3. Deploy it
 
-This deployment gets the single A10G on an `ml.g5.2xlarge`, so the entrypoint selects tensor parallel 1. Deploy the same image unchanged on a 4-GPU `ml.g5.12xlarge` with `nvidia.com/gpu: "4"` and it selects tensor parallel 4. It also sets explicit probes: a `startupProbe` that allows up to 10 minutes for weights to load before Kubernetes starts restarting the container.
+Deploy your image with the command below. It requests one GPU, the single A10G on an `ml.g5.2xlarge`. In the YAML, look at two things:
+
+- **`nvidia.com/gpu: "1"`**: the entrypoint counts the GPUs it gets and sets tensor parallelism to match, here 1. You don't change anything for bigger instances. On a 4-GPU `ml.g5.12xlarge`, you'd request `"4"` and the same image would select tensor parallel 4. This lab doesn't have that instance, so just read this part.
+- **The probes**: a `startupProbe` gives the weights up to 10 minutes to load before Kubernetes restarts the container.
 
 ```bash
 cat > qwen-byoc.yaml <<EOF
