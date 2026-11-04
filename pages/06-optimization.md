@@ -1,17 +1,41 @@
 # 6. Optimize: tiered KV cache, routing, and model caching
 
-A plain deployment recomputes every prompt from scratch unless the exact prefix is still in GPU memory, sends each request to whichever replica the load balancer picks, and starts every new pod by reading the weights from S3 and pulling a 9 GB image. The inference operator has three features that address each of these, all set on the same `InferenceEndpointConfig`:
+In this lab you deploy one endpoint with three inference operator features turned on, then measure what each one does. They matter because a plain deployment wastes work in three places:
 
-- **Tiered KV cache** (`kvCacheSpec`). When vLLM processes a prompt it computes key and value tensors for every token: the KV cache. vLLM reuses them while they stay in GPU memory. The operator adds [LMCache](https://docs.lmcache.ai/) behind vLLM so that KV blocks are also kept outside the GPU, in two tiers. **L1** lives in the model server's own CPU memory: fast, but gone when the pod restarts. **L2** lives in a cache service that runs on every node, outside the pod: SageMaker HyperPod managed tiered storage, or a Redis cluster you provide. A request whose prefix is in L1 or L2 copies the tensors back instead of recomputing them.
-- **Intelligent routing** (`intelligentRoutingSpec`). The operator puts a router in front of the replicas. With the `prefixaware` strategy, requests that share a prompt prefix go to the replica that already holds that prefix in its cache.
-- **Model caching** (`modelCacheConfig`). The operator pre-pulls the serving image onto the GPU nodes (`imageCache`) and copies the model weights to the node's local NVMe disk (`weightsCache`) before the pods start, so new replicas skip the image pull and the S3 read.
+- It recomputes every prompt from scratch unless the exact prefix is still in GPU memory.
+- It sends each request to whichever replica the load balancer picks, so a replica that already processed a prompt may never see its follow-up.
+- Every new pod reads the weights from S3 and pulls a 9 GB image before it can serve.
 
-In this module you turn on the cluster's tiered storage, deploy an optimized endpoint, measure the L1 cache with a workload that revisits long prompts, look at how the router keeps prefixes on one replica, and show that a prefix in L2 survives a restart of the model server.
+The three features are all set on the same `InferenceEndpointConfig`:
+
+- **Tiered KV cache** (`kvCacheSpec`). When vLLM processes a prompt, it computes key and value tensors for every token. These are the **KV cache**. vLLM reuses them for a later prompt that starts with the same tokens (**prefix caching**), but only while they stay in GPU memory. The operator adds [LMCache](https://docs.lmcache.ai/), a KV cache library, behind vLLM so that KV blocks are also kept outside the GPU, in two tiers:
+  - **L1** is the model server's own CPU memory. It's fast, but it's gone when the pod restarts.
+  - **L2** is a cache service that runs on every node, outside the pod: either SageMaker HyperPod **managed tiered storage** or a Redis cluster you provide.
+
+  A request whose prefix is in L1 or L2 copies the tensors back instead of recomputing them.
+- **Intelligent routing** (`intelligentRoutingSpec`). The operator puts a router in front of the replicas. With the `prefixaware` strategy (**prefix-aware routing**), requests that share a prompt prefix go to the replica that already holds that prefix in its cache.
+- **Model caching** (`modelCacheConfig`). Before the pods start, the operator pre-pulls the serving image onto the GPU nodes (the **image cache**, `imageCache`) and copies the model weights to each node's local NVMe disk (the **weights cache**, `weightsCache`). New replicas skip the image pull and the S3 read.
+
+What you'll do:
+
+1. Check that the cluster has room (Step 1).
+2. Turn on the cluster's tiered storage (Step 2).
+3. Deploy the optimized endpoint and watch the caches warm (Steps 3 and 4).
+4. Follow a request through the router (Step 5).
+5. Measure the L1 cache with a workload that revisits long prompts (Step 6).
+6. See how the router keeps each prefix on one replica (Step 7).
+7. Show that a prefix in L2 survives a restart of the model server (Step 8).
+
+Run the steps in order: each one builds on the previous one.
 
 > [!NOTE]
-> Budget about 40 minutes, most of it waiting for the caches and the endpoint. The module uses both GPUs and the model weights you staged in S3 in module 4. It also needs pod slots: up to four more pods on each GPU node (the model, the tiered storage daemon, the image cache, and the router) and three on the CPU node. Step 1 checks them.
+> Budget about 40 minutes, most of it waiting for the caches and the endpoint. This lab needs both GPUs, the model weights you staged in S3 in lab 4, and free pod slots: up to four more pods on each GPU node (the model, the tiered storage daemon, the image cache, and the router) and three on the CPU node. Step 1 checks all of this.
 
 ## Step 1: Set your environment
+
+First, set the variables the rest of the lab uses and confirm the prerequisites.
+
+The commands below set the endpoint name, the model location, the serving image, and the CPU and memory for your instance type. They count the GPU nodes, check that the weights from lab 4 are in S3, and list any models still deployed:
 
 ```bash
 export ENDPOINT_NAME=qwen-opt
@@ -26,13 +50,19 @@ export REPLICAS=$(kubectl get nodes -l node.kubernetes.io/instance-type="$INSTAN
 echo "$INSTANCE_TYPE cpu=$MODEL_CPU memory=$MODEL_MEMORY replicas=$REPLICAS"
 
 aws s3 ls s3://$MODEL_BUCKET/$MODEL_PREFIX/config.json --region $REGION >/dev/null \
-  && echo "weights staged" || echo "Stage the weights first: module 4, Amazon S3 lab"
+  && echo "weights staged" || echo "Stage the weights first: lab 4, Amazon S3 lab"
 kubectl get inferenceendpointconfig,jumpstartmodel -A
 ```
 
-`REPLICAS` is the number of GPU nodes: one replica per GPU. The last command should list nothing: delete any deployment the earlier modules left, so both GPUs are free. With one GPU node the module still works; routing just has no choice to make.
+Expected:
 
-Check that every node has room for this module's pods. HyperPod limits pods per node (14 on an `ml.g5.2xlarge`, 29 on an `ml.c5.4xlarge`):
+- `ml.g5.2xlarge cpu=4 memory=16Gi replicas=2`. `REPLICAS` is the number of GPU nodes: the lab runs one replica per GPU. With one GPU node the lab still works, but in Step 7 the router has only one replica to choose from.
+- `weights staged`. If you see `Stage the weights first`, run the Amazon S3 part of [lab 4](04-bring-your-own-model.md) first.
+- `No resources found` from the last command. If it lists deployments left by earlier labs, delete them with the first command under "If a node shows NOT ENOUGH" below, even if every node shows `OK`. Both GPUs must be free.
+
+### Check the pod slots
+
+HyperPod limits how many pods each node can run: 14 on an `ml.g5.2xlarge`, 29 on an `ml.c5.4xlarge`. The command below counts the pods on each node and compares the free slots with what this lab needs (4 on a GPU node, 3 on the CPU node):
 
 ```bash
 for n in $(kubectl get nodes -o name | cut -d/ -f2); do
@@ -48,34 +78,48 @@ for n in $(kubectl get nodes -o name | cut -d/ -f2); do
 done
 ```
 
-If a node shows `NOT ENOUGH`, the list under it shows what fills it. About 7 pods per node in `kube-system` are system DaemonSets that always stay. Free the rest:
+Expected: one line per node, each ending in `OK`, for example `hyperpod-i-0abc... GPU: 9 of 14 pods, 5 free, needs 4: OK`. If every node shows `OK`, go to Step 2.
+
+### If a node shows NOT ENOUGH
+
+Under a `NOT ENOUGH` line, the check lists the namespaces of the pods on that node, with the number of pods in each. About 7 pods per node in `kube-system` are system DaemonSets (one pod per node, always present); leave them. Find the other namespaces in the table and run the matching fix:
 
 | Namespace in the list | What it is | Fix |
 |---|---|---|
-| `default` | Models left by earlier modules, including `tinyllama-dd` | Delete them (first command below) |
-| `hyperpod-observability` | The optional observability add-on: 3 to 6 pods per node. Only modules 2 and 3 use it | Remove it (second command below). This also deletes the Prometheus workspace and its metrics |
-| `hyperpod-inference-system`, other controllers | Controllers that can run on the CPU node | Rerun setup (third command below) |
+| `default` | Models left by earlier labs, including `tinyllama-dd` | Delete them (first command below) |
+| `hyperpod-observability` | The optional observability add-on: 3 to 6 pods per node. Only labs 2 and 3 use it | Remove it (second command below). This also deletes the Prometheus workspace and its metrics |
+| `hyperpod-inference-system`, other controllers | Controllers that can run on the CPU node | Rerun setup (third command below), which moves them there |
 
-Each command is safe to run when there's nothing to remove:
+Run only the fixes you need. Each command is safe to run when there's nothing to remove.
+
+Fix 1. Delete the models left by earlier labs:
 
 ```bash
-kubectl delete inferenceendpointconfig tinyllama-dd qwen-hf qwen-s3 qwen-fsx qwen-byoc -n $NAMESPACE --ignore-not-found
+kubectl delete inferenceendpointconfig tinyllama-dd qwen-hf qwen-s3 qwen-fsx qwen-byoc qwen-opt -n $NAMESPACE --ignore-not-found
 kubectl delete jumpstartmodel deepseek-js -n $NAMESPACE --ignore-not-found
 ```
+
+Expected: a `deleted` line for each model that existed, nothing for the others.
+
+Fix 2. Remove the observability add-on (takes a few minutes):
 
 ```bash
 ~/hyperpod-inference-dive-deep/scripts/observability.sh --remove -y
 ```
 
+Fix 3. Rerun setup to move the controllers to the CPU node (takes a few minutes):
+
 ```bash
 ~/hyperpod-inference-dive-deep/scripts/setup.sh -y
 ```
 
-Then run the check again until every node shows `OK`.
+Then run the pod slot check again. Repeat until every node shows `OK`. If GPU nodes still show other models or training jobs (for example from lab 7 or the base workshop), run `~/hyperpod-inference-dive-deep/scripts/reset-gpus.sh -y`, which frees both GPU nodes.
 
 ## Step 2: Turn on the cluster's tiered storage
 
-The L2 tier needs a cache service on the nodes, and HyperPod provides one: **managed tiered storage**, a memory-management daemon that HyperPod also uses for in-memory training checkpoints. It's a cluster setting, off by default. Turn it on with 20% of each node's memory, the minimum:
+The L2 tier needs a cache service on each node. HyperPod provides one: **managed tiered storage**, a memory-management daemon that HyperPod also uses for in-memory training checkpoints. It's a cluster setting, off by default, and you set what share of each node's memory it reserves.
+
+The command below turns it on with 20% of each node's memory (the minimum), then shows the cluster's setting:
 
 ```bash
 aws sagemaker update-cluster --cluster-name "$HYPERPOD_CLUSTER_NAME" --region $REGION \
@@ -84,17 +128,27 @@ aws sagemaker describe-cluster --cluster-name "$HYPERPOD_CLUSTER_NAME" --region 
   --query TieredStorageConfig --output table
 ```
 
-The update completes in seconds. Within about a minute, HyperPod starts the daemon, `ai-toolkit`, on every node:
+Expected: `update requested`, then a table with `Mode` set to `Enable` and `InstanceMemoryAllocationPercentage` set to `20`. The update completes in seconds.
+
+Within about a minute, HyperPod starts the daemon, called `ai-toolkit`, on every node. The command below lists the daemon pods:
 
 ```bash
 kubectl get pods -n aws-hyperpod -o wide | grep -E 'NAME|ai-toolkit'
 ```
 
-Run it again until there is one `ai-toolkit` pod per node, `1/1 Running`. A restart or two in the first minute is normal while the daemons find each other. Each pod uses the host network and listens on port 9200 of its node. The model pods reach the daemon on their own node there and share a memory segment with it. The daemon reserves the 20% (about 6.4 GiB on an `ml.g5.2xlarge`), of which 1 GiB holds KV cache in this configuration.
+Expected: one `ai-toolkit` pod per node, `1/1 Running`. If some are missing or not yet running, wait a minute and run the command again. A restart or two in the first minute is normal while the daemons find each other.
+
+How the model pods use the daemon (for reference; nothing to run):
+
+- Each `ai-toolkit` pod uses the host network and listens on port 9200 of its node.
+- A model pod reaches the daemon on its own node at that port and shares a memory segment with it.
+- The daemon reserves the 20% (about 6.4 GiB on an `ml.g5.2xlarge`). In this configuration, 1 GiB of it holds KV cache.
 
 ## Step 3: Apply the optimized InferenceEndpointConfig
 
-Intelligent routing, KV caching, and model caching are applied only when a deployment is created; you can't add them to a running one. Note the time before you apply:
+Now deploy the endpoint with all three features. Intelligent routing, KV caching, and model caching apply only when a deployment is created; you can't add them to a running one.
+
+The command below prints the time (you use it to measure how long the deployment takes) and applies the `InferenceEndpointConfig`. It starts at zero replicas so the caches can warm first; you scale up in Step 4:
 
 ```bash
 date
@@ -169,7 +223,13 @@ spec:
 EOF
 ```
 
-The serving image is the AWS vLLM Deep Learning Container, SageMaker variant. It includes LMCache and takes its vLLM flags from `SM_VLLM_*` variables, so this manifest has no `args`.
+Expected: the current time, then `inferenceendpointconfig.inference.sagemaker.aws.amazon.com/qwen-opt created`.
+
+### What the manifest sets
+
+For reference; nothing to run.
+
+The serving image is the AWS vLLM Deep Learning Container, SageMaker variant. It includes LMCache and builds vLLM's command-line flags from `SM_VLLM_*` environment variables, so this manifest has no `args`.
 
 | Field | Value here | Why |
 |---|---|---|
@@ -188,7 +248,9 @@ The serving image is the AWS vLLM Deep Learning Container, SageMaker variant. It
 
 ## Step 4: Watch the caches warm, then scale up
 
-The operator creates the Deployment with no pods and starts on the caches:
+The operator creates the Deployment with no pods and starts filling the image and weights caches. You wait until both caches are ready on every GPU node, then scale up. Scaling up earlier leaves a pod stuck `Pending` (see Troubleshooting).
+
+The commands below show the Deployment, the weights cache, the image cache, and the cache-ready labels on the nodes:
 
 ```bash
 kubectl get deploy "$ENDPOINT_NAME" -n $NAMESPACE
@@ -197,7 +259,16 @@ kubectl get modelimagecache -n hyperpod-inference-system
 kubectl get nodes --show-labels | tr ',' '\n' | grep cache-ready
 ```
 
-Run the commands again every minute or so. The Deployment shows `0/0`. The weights cache appears first: a `cache-dl-...` pod runs on each GPU node, and the `ModelWeightsCacheConfig` reaches `Ready` with `READY` equal to `TARGET`, the number of GPU nodes. The image cache follows: a `ModelImageCache` for the vLLM image on your instance type, which pulls the 9 GB image onto each GPU node. Both labels appear about nine minutes after the apply, most of it the image pull. In your own clusters, `imageCache` is how you get this effect for every node: the pull happens when a node joins, before any pod waits for it. When each GPU node carries both an `image-cache-ready.<id>=true` and a `weights-cache-ready.<id>=true` label, scale up:
+Run them again every minute or so. What you see, in order:
+
+1. The Deployment shows `0/0` the whole time.
+2. The weights cache appears first. A `cache-dl-...` download pod runs on each GPU node, and the `ModelWeightsCacheConfig` reaches `Ready`, with `READY` equal to `TARGET` (the number of GPU nodes).
+3. The image cache follows: a `ModelImageCache` for the vLLM image on your instance type, which pulls the 9 GB image onto each GPU node.
+4. The node labels appear. You're ready when the last command prints, for each GPU node, one `image-cache-ready.<id>=true` and one `weights-cache-ready.<id>=true` line (two of each with two GPU nodes).
+
+This takes about nine minutes after the apply, most of it the image pull. In your own clusters, `imageCache` gives every node this head start: the pull happens when a node joins, before any pod waits for it.
+
+When both labels are on every GPU node, the commands below scale the Deployment to one replica per GPU node, wait for the rollout, and list the pods:
 
 ```bash
 kubectl scale deploy/"$ENDPOINT_NAME" -n $NAMESPACE --replicas="$REPLICAS"
@@ -205,7 +276,9 @@ kubectl rollout status deploy/"$ENDPOINT_NAME" -n $NAMESPACE --timeout=10m
 kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o wide
 ```
 
-Each pod is `3/3 Running` within about two minutes. Confirm what the model container started with:
+Expected, within about two minutes: `successfully rolled out`, and one pod per GPU node, each `3/3 Running`.
+
+The command below filters the model container's log for the lines that show what it started with:
 
 ```bash
 POD=$(kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o jsonpath='{.items[0].metadata.name}')
@@ -213,7 +286,7 @@ kubectl logs -n $NAMESPACE "$POD" -c "$ENDPOINT_NAME" \
   | grep -E 'server arguments|Loading weights took|GPU KV cache size|Creating LMCacheEngine|Connector initialized|startup complete' | cut -c1-200
 ```
 
-Five things to find in the output:
+Expected: these five things in the output.
 
 - The `vLLM server arguments` line contains `--kv-cache-memory-bytes 1073741824` and `--kv-transfer-config {"kv_connector":"LMCacheConnectorV1",...}`.
 - `Loading weights took` a few seconds: the weights come from the local NVMe copy, not from S3. The pod's `cache-resolver` init container linked the cached files into `/opt/ml/model`.
@@ -221,27 +294,33 @@ Five things to find in the output:
 - `Creating LMCacheEngine with config: {'chunk_size': 256, 'local_cpu': True, 'max_local_cpu_size': 7.0, ...`: the L1 tier, 7 GB of the pod's memory, stored in chunks of 256 tokens.
 - `SageMaker HyperPod Connector initialized: url=http://<node IP>:9200, bucket=lmcache, shared_memory=ai_toolkit_cache`: the L2 tier, the daemon from Step 2.
 
-Then wait for the SageMaker endpoint:
+If a line is missing, see Troubleshooting at the end of this page.
+
+The commands below wait for the SageMaker endpoint to exist and then to reach `InService`, and print the time:
 
 ```bash
 until aws sagemaker describe-endpoint --endpoint-name "$ENDPOINT_NAME" --region $REGION >/dev/null 2>&1; do sleep 15; done
 aws sagemaker wait endpoint-in-service --endpoint-name "$ENDPOINT_NAME" --region $REGION && date
 ```
 
-Expect about 12 minutes from the `kubectl apply` to `InService`. On this small model the caches mainly change where the time goes: the image pull and the weight download happen before the pods are scheduled. Their effect grows with the size of the model and the number of fresh nodes a deployment scales onto.
+Expected: the command returns with the time, a few minutes after the pods are running. Compare it with the time Step 3 printed: about 12 minutes from the apply to `InService`.
+
+On this small model, the caches mainly change where the time goes: the image pull and the weight download happen before the pods are scheduled, not while a pod waits. Their effect grows with the size of the model and with the number of fresh nodes a deployment scales onto.
 
 ## Step 5: Follow a request through the router
 
-The request path now has one more hop. Look at what the operator created for the endpoint in its own namespace:
+With routing enabled, the request path has one more hop: load balancer, then router, then model pod. In this step you find the router and confirm it forwards your request to a model pod.
+
+The commands below list what the operator created for the endpoint in its own namespace, and where the load balancer's route points:
 
 ```bash
 kubectl get deploy,svc,ingress -n hyperpod-inference-system | grep "$ENDPOINT_NAME"
 kubectl get ingress -n hyperpod-inference-system -o jsonpath='{range .items[*].spec.rules[*].http.paths[*]}{.path} -> {.backend.service.name}{"\n"}{end}'
 ```
 
-The load balancer's single route is `/v1/chat/completions`, and it forwards to `qwen-opt-<namespace>-routing-service`, the router's Service, not to the model pods. The router discovers the model pods by their `app=qwen-opt` label and forwards each request to one of them.
+Expected: a router Deployment, its Service, and an Ingress for `qwen-opt`. The last line shows the load balancer's single route, `/v1/chat/completions -> qwen-opt-<namespace>-routing-service`. That's the router's Service, not the model pods. The router finds the model pods by their `app=qwen-opt` label and forwards each request to one of them.
 
-Invoke the endpoint. The body needs a `model` field: the router uses it to find the model's replicas and rejects requests without it.
+The command below sends one chat request through SageMaker. The body needs a `model` field: the router uses it to find the model's replicas and rejects requests without it.
 
 ```bash
 time aws sagemaker-runtime invoke-endpoint --region $REGION \
@@ -251,7 +330,9 @@ time aws sagemaker-runtime invoke-endpoint --region $REGION \
   --cli-binary-format raw-in-base64-out /dev/stdout
 ```
 
-Find your request in the router's log:
+Expected: a JSON chat completion with a one-sentence answer, then the elapsed time, usually under a few seconds.
+
+The commands below find your request in the router's log and list the model pods with their IPs:
 
 ```bash
 ROUTER=$(kubectl get pods -n hyperpod-inference-system -o name | grep "${ENDPOINT_NAME}-${NAMESPACE}-router")
@@ -259,11 +340,28 @@ kubectl logs -n hyperpod-inference-system "$ROUTER" -c router-container --tail=5
 kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o wide
 ```
 
-Each line reads `Routing request <id> with session id None to http://<pod IP>:8081`, and the IP is one of your model pods (port 8081 is the pod's reverse-proxy sidecar, in front of vLLM on 8080). The router also logs `No cache hit, forwarding request to backend` for every request; that refers to the router's own response cache, which isn't enabled, not to the KV cache.
+Expected:
+
+- Each router line reads `Routing request <id> with session id None to http://<pod IP>:8081`.
+- The IP matches one of the model pods in the list. Port 8081 is the pod's reverse-proxy sidecar, which sits in front of vLLM on 8080.
+
+The router also logs `No cache hit, forwarding request to backend` for every request. That refers to the router's own response cache, which isn't enabled here, not to the KV cache. You can ignore it.
 
 ## Step 6: Measure the L1 cache
 
-The benchmark below builds 14 synthetic documents of about 3,800 tokens each, about 53,000 tokens in total: more than the GPU KV cache holds. It sends each document once with a question (pass 1), then each document again with a different question (pass 2). The two requests for a document share their whole prefix: the system message with the document. By the time pass 2 comes back to a document, the GPU has evicted it to make room for the others, so its prefix has to come from LMCache. Each request asks for at most four tokens, so its latency is mostly the time to process the prompt. `NUM_DOCS` and `DOC_OFFSET` choose other documents, and `revisit` runs pass 2 only; Step 8 uses both.
+Now measure what LMCache saves when prompts come back after the GPU has evicted them.
+
+How the benchmark works (the script below runs it):
+
+- It builds 14 synthetic documents of about 3,800 tokens each, about 53,000 tokens in total. That's more than the GPU KV cache holds (about 37,000 tokens).
+- Pass 1 sends each document once, with a question. Every prefix is new.
+- Pass 2 sends each document again, with a different question. The two requests for a document share their whole prefix: the system message that holds the document.
+- By the time pass 2 comes back to a document, the GPU has evicted it to make room for the others, so a hit has to come from LMCache.
+- Each request asks for at most four tokens, so its latency is mostly the time to process the prompt, close to the **time to first token (TTFT)**.
+
+The script also takes options that Step 8 uses: `NUM_DOCS` and `DOC_OFFSET` choose other documents, and the argument `revisit` runs pass 2 only.
+
+The command below writes the benchmark to `kvbench.py` and runs it:
 
 ```bash
 cat > kvbench.py <<'EOF'
@@ -305,14 +403,22 @@ EOF
 python3 kvbench.py
 ```
 
-It takes about 30 seconds. The output looks similar to this:
+It takes about 30 seconds. Expected output, similar to this:
 
 ```text
 pass 1: every prefix new         median    687 ms   min   678  max  2507   prompt tokens 53,276
 pass 2: same prefixes, revisited median    451 ms   min   444  max   508   prompt tokens 53,276
 ```
 
-Pass 2 is about a third faster, measured end to end through SageMaker, the load balancer, and the router. The `max` of pass 1 is the first request after the deployment, which also warms vLLM up. To see where the saving comes from, read vLLM's own counters on each replica. Forward a local port (18080, because Code Editor already uses 8080) and filter `/metrics`:
+How to read it:
+
+- Each line shows the median, fastest, and slowest request latency of the pass, in milliseconds, measured end to end through SageMaker, the load balancer, and the router. `prompt tokens` is the total over the 14 requests; it's the same in both passes.
+- Compare the two medians. Good looks like pass 2 about a third faster than pass 1: the prefixes came from a cache instead of being recomputed. Your absolute numbers will differ.
+- The high `max` of pass 1 is the first request after the deployment, which also warms vLLM up. Ignore it.
+
+### Where the saving comes from
+
+vLLM counts cache hits on each replica. The command below forwards a local port to each model pod in turn (18080, because Code Editor already uses 8080) and prints three counters from its `/metrics` page:
 
 ```bash
 for p in $(kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o jsonpath='{.items[*].metadata.name}'); do
@@ -327,25 +433,35 @@ for p in $(kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o jsonpath='{
 done
 ```
 
+What the counters mean:
+
 - `vllm:prefix_cache_hits_total`: prompt tokens found in the GPU KV cache.
 - `vllm:external_prefix_cache_hits_total`: tokens vLLM didn't compute because LMCache supplied them.
 - `lmcache:local_cache_usage`: what pass 1 left in L1, out of 7 GB. LMCache looks in L1 first.
 
-With **one replica**, `prefix_cache_hits_total` is 0 and `external_prefix_cache_hits_total` is about 50,000: revisiting the documents in order evicted each one from the GPU shortly before it was needed again, and every complete 256-token chunk of each document came back from L1 in pass 2. With **two replicas**, read Step 7 first.
+Expected, depending on how many replicas you have:
 
-The model container's log shows the same thing request by request:
+- **Two replicas** (the usual case, with two GPU nodes): `vllm:prefix_cache_hits_total` is high, about 53,000 tokens across the two pods, and `external_prefix_cache_hits_total` is close to 0. Each replica's share of the documents fits in its GPU cache, so pass 2 hits in GPU memory. Step 7 explains why.
+- **One replica**: `prefix_cache_hits_total` is 0 and `external_prefix_cache_hits_total` is about 50,000. Revisiting the documents in order evicted each one from the GPU shortly before it was needed again, so in pass 2 every complete 256-token chunk of each document came back from L1.
+
+The command below shows the same thing request by request, from the log of the pod Step 4 inspected:
 
 ```bash
 kubectl logs -n $NAMESPACE "$POD" -c "$ENDPOINT_NAME" | grep -E 'LMCache hit tokens: [1-9]|Retrieved' | head -2 | cut -c1-200
 ```
 
-With one replica, a cache hit logs `LMCache hit tokens: 3584, need to load: 3584`, followed by `Retrieved 3584 out of 3584 required tokens`, which takes a few milliseconds: copying 3,584 tokens of KV back from CPU memory replaced recomputing them on the GPU. With two replicas it logs `need to load: 0`: LMCache has the prefix, but the GPU still holds it, so nothing needs copying (Step 7).
+Expected:
+
+- **Two replicas**: `LMCache hit tokens: 3584, need to load: 0`. LMCache has the prefix, but the GPU still holds it, so nothing needs copying (Step 7).
+- **One replica**: `LMCache hit tokens: 3584, need to load: 3584`, followed by `Retrieved 3584 out of 3584 required tokens`, which takes a few milliseconds. Copying 3,584 tokens of KV back from CPU memory replaced recomputing them on the GPU.
 
 ## Step 7: Routing with two replicas
 
-With two GPU nodes you have two replicas, and each has its own GPU cache and its own L1. A document's KV blocks are in the caches of the replica that processed it in pass 1. Pass 2 only finds them if the router sends the document back to that replica, which is what `prefixaware` does. With `roundrobin`, about half of the pass 2 requests would land on the other replica and compute their prefix again.
+This step shows why prefix-aware routing matters once you have more than one replica. If you have one GPU node, read it and go to Step 8.
 
-Count which replica the router chose for each request, and on each replica how many requests found their prefix already cached:
+Each replica has its own GPU cache and its own L1. A document's KV blocks are in the caches of the replica that processed it in pass 1. Pass 2 finds them only if the router sends the document back to that same replica, which is what `prefixaware` does. With `roundrobin` (take turns), about half of the pass 2 requests would land on the other replica and compute their prefix again.
+
+The commands below count, from the router's log, how many requests went to each replica in the last 10 minutes, and, from each model pod's log, how many requests found their prefix in LMCache:
 
 ```bash
 ROUTER=$(kubectl get pods -n hyperpod-inference-system -o name | grep "${ENDPOINT_NAME}-${NAMESPACE}-router")
@@ -356,11 +472,27 @@ for p in $(kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o jsonpath='{
 done
 ```
 
-The router spreads the 14 new documents of pass 1 over the two replicas, in testing 16 and 14 requests including Step 5's, and sends every document back to the same replica in pass 2: the per-pod counts (7 and 7) add up to 14. Each replica only has to hold its half of the documents, about 26,000 tokens, which fits into its GPU cache. So in Step 6's counters, `vllm:prefix_cache_hits_total` is no longer 0: the two replicas together report about 53,000 hit tokens, the whole of pass 2, straight from GPU memory, and `external_prefix_cache_hits_total` hardly moves. Prefix-aware routing turned two GPU caches into one cache twice the size.
+Expected, similar to this (in testing):
+
+- The router's counts: two pod IPs with roughly even counts, for example 16 and 14. That's the 28 benchmark requests plus Step 5's requests. The router spread the 14 new documents of pass 1 over the two replicas.
+- The per-pod hit counts: for example 7 and 7, which add up to 14. Every pass 2 request went back to the replica that had its document.
+
+What this means:
+
+- Each replica only holds its half of the documents, about 26,000 tokens, which fits in its GPU cache.
+- That's why Step 6's `vllm:prefix_cache_hits_total` was about 53,000 across the two replicas: the whole of pass 2 came straight from GPU memory, and `external_prefix_cache_hits_total` hardly moved.
+- Prefix-aware routing turned two GPU caches into one cache twice the size.
 
 ## Step 8: L2 survives a restart
 
-L1 belongs to the model server process: when the pod restarts, it's empty. L2 lives in the node's tiered storage daemon, outside the pod. Prove it with one new document: send it once, delete the model pods, and ask about it again on the replacements. One document is about 100 MB of KV; the end of this step explains why the test stays this small.
+L1 belongs to the model server process: when the pod restarts, it's empty. L2 lives in the node's tiered storage daemon, outside the pod. In this step you prove that L2 keeps a prefix across a restart.
+
+The test uses one new document (about 100 MB of KV; the end of this step explains why the test stays this small). The commands below:
+
+1. send the document once (pass 1),
+2. delete the model pods, so their L1 is lost,
+3. wait for the replacement pods and for the endpoint to answer again,
+4. ask about the document again (pass 2 only).
 
 ```bash
 NUM_DOCS=1 DOC_OFFSET=500 python3 kvbench.py
@@ -373,7 +505,9 @@ until aws sagemaker-runtime invoke-endpoint --region $REGION --endpoint-name "$E
 NUM_DOCS=1 DOC_OFFSET=500 python3 kvbench.py revisit
 ```
 
-The replacement pods serve about two minutes after the delete, and the last command sends pass 2 for the document. Read the counters of the new pods:
+It takes about three minutes; the replacement pods serve about two minutes after the delete. Expected: a `pass 1` line, `pod ... deleted` lines, `condition met` lines, and a `pass 2` line. Ignore the latency the benchmark prints here: the first requests on a freshly started pod are slower anyway.
+
+The command below reads the cache counters and LMCache log lines of the new pods:
 
 ```bash
 for p in $(kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o jsonpath='{.items[*].metadata.name}'); do
@@ -389,9 +523,23 @@ for p in $(kubectl get pods -n $NAMESPACE -l app="$ENDPOINT_NAME" -o jsonpath='{
 done
 ```
 
-The pod that served the request shows `vllm:external_prefix_cache_hits_total 3584`, `lmcache:num_remote_read_bytes_total` about 205 MB, and `Retrieved 3584 out of 3584 required tokens ... cost 121 ms` (the other pod shows zeros). The new pod had never seen the document and its L1 was empty, and still 3,584 tokens came from LMCache, read from the tiered storage daemon. The daemons also exchange data between nodes: the request may land on another node than the one that computed the document, and it still hits. In that case `num_remote_read_bytes_total` stays at 0, and the `Retrieved` line and `external_prefix_cache_hits_total` show the hit. A read from L2 costs tens of milliseconds, against a few milliseconds from L1, both far cheaper than recomputing the prefix of a large model. Ignore the latency the benchmark prints here: the first requests on a freshly started pod are slower anyway.
+Expected, on the pod that served the request (the other pod shows zeros):
+
+- `vllm:external_prefix_cache_hits_total 3584`
+- `lmcache:num_remote_read_bytes_total` about 205 MB
+- `Retrieved 3584 out of 3584 required tokens ... cost 121 ms`
+
+How to read it:
+
+- The new pod had never seen the document, and its L1 was empty. Still, 3,584 tokens came from LMCache, read from the tiered storage daemon (L2).
+- The daemons also exchange data between nodes, so the request may land on a different node than the one that computed the document and still hit. In that case `num_remote_read_bytes_total` stays at 0, and the `Retrieved` line and `external_prefix_cache_hits_total` show the hit.
+- A read from L2 costs tens of milliseconds, against a few milliseconds from L1. Both are far cheaper than recomputing the prefix of a large model.
 
 This is also where `PYTHONHASHSEED` matters. Without it, the replacement pod names the same tokens differently and finds nothing in L2.
+
+### Comparing the tiers
+
+For reference; nothing to run.
 
 | Tier | Where | Size here | Survives a pod restart | Shared with other replicas | Copy cost for one document |
 |---|---|---|---|---|---|
@@ -399,7 +547,7 @@ This is also where `PYTHONHASHSEED` matters. Without it, the replacement pod nam
 | L1 | model server's CPU memory | 7 GB, about 250,000 tokens | no | no | a few ms |
 | L2 | tiered storage daemons on the nodes | 1 GiB per node, about 37,000 tokens | yes | yes, also across nodes | tens of ms |
 
-L2 admits data the way a modern cache does: a block written once and not read again soon is evicted early, to protect blocks that are read repeatedly. Run Step 6's benchmark against freshly restarted pods and almost nothing comes back from L2. A prefix that many requests share, such as a long system prompt, a retrieved document, or a tool catalog, is exactly what it keeps. Size L2 for hot prefixes, and keep L1 for the working set of each replica.
+Why the test uses one document: L2 evicts a block that was written once and not read again soon, to protect blocks that are read repeatedly. If you ran Step 6's 14-document benchmark against freshly restarted pods, almost nothing would come back from L2. A prefix that many requests share, such as a long system prompt, a retrieved document, or a tool catalog, is what L2 keeps. Size L2 for hot prefixes, and keep L1 for the working set of each replica.
 
 ## What to take away
 
@@ -409,6 +557,10 @@ L2 admits data the way a modern cache does: a block written once and not read ag
 
 ## Clean up
 
+Delete the endpoint and turn tiered storage off, so the GPUs and the node memory are free for the next lab.
+
+The commands below delete the `InferenceEndpointConfig`, wait until its SageMaker endpoint is gone, and disable tiered storage:
+
 ```bash
 kubectl delete inferenceendpointconfig "$ENDPOINT_NAME" -n $NAMESPACE
 until ! aws sagemaker describe-endpoint --endpoint-name "$ENDPOINT_NAME" --region $REGION >/dev/null 2>&1; do sleep 10; done
@@ -416,21 +568,25 @@ aws sagemaker update-cluster --cluster-name "$HYPERPOD_CLUSTER_NAME" --region $R
   --tiered-storage-config Mode=Disable >/dev/null && echo "tiered storage: disable requested"
 ```
 
-Disabling tiered storage removes the `ai-toolkit` daemons and returns the 20% of node memory.
+Expected: `inferenceendpointconfig... "qwen-opt" deleted`, then, after a minute or two, `tiered storage: disable requested`. Disabling tiered storage removes the `ai-toolkit` daemons and returns the 20% of node memory.
+
+If a later lab finds the GPUs taken, `~/hyperpod-inference-dive-deep/scripts/reset-gpus.sh -y` also removes this lab's image and weights caches and tiered storage.
 
 ## Troubleshooting
 
 - **The endpoint never appears; `kubectl describe inferenceendpointconfig` shows `IntelligentRoutingValidationFailed`.** `invocationEndpoint` isn't one of vLLM's routes. The operator doesn't retry a deployment that failed validation: delete the `InferenceEndpointConfig` and apply it again with `v1/chat/completions`.
-- **The Deployment never appears; `kubectl get events -n $NAMESPACE | grep DeploymentCreateFailed` shows `volumeMounts[...].name: Not found: "lmcache-config"`.** The manifest sets `prefetchEnabled` together with the L2 tier. Delete it and apply it again without `prefetchEnabled`.
+- **The Deployment never appears; `kubectl get events -n $NAMESPACE | grep DeploymentCreateFailed` shows `volumeMounts[...].name: Not found: "lmcache-config"`.** The manifest sets `prefetchEnabled` together with the L2 tier. Delete the `InferenceEndpointConfig` and apply it again without `prefetchEnabled`.
 - **`invoke-endpoint` returns `ModelError` with `missing 'model' in request body`.** The router needs the `model` field: add `"model":"qwen-opt"` to the body.
-- **A model pod stays `Pending` with `Insufficient nvidia.com/gpu`, from a newer ReplicaSet.** The Deployment was scaled up before both caches were warm, and the operator's template update is waiting for a free GPU. Scale to zero and back: `kubectl scale deploy/"$ENDPOINT_NAME" -n $NAMESPACE --replicas=0`, wait until the pods are gone, then scale to `$REPLICAS` again.
-- **A pod stays `Pending` with `Too many pods`.** The node is at its pod limit. See the pod budget on the overview page.
+- **A model pod stays `Pending` with `Insufficient nvidia.com/gpu`, from a newer ReplicaSet.** The Deployment was scaled up before both caches were warm, and the operator's template update is waiting for a free GPU. Scale to zero with `kubectl scale deploy/"$ENDPOINT_NAME" -n $NAMESPACE --replicas=0`, wait until the pods are gone, then scale to `$REPLICAS` again. If the pending pod is waiting for a GPU that another lab's model holds, run `~/hyperpod-inference-dive-deep/scripts/reset-gpus.sh -y` instead and start this lab again from Step 2.
+- **A pod stays `Pending` with `Too many pods`.** The node is at its pod limit. Run Step 1's pod slot check and its fixes. The overview page explains the pod budget per node.
 - **No `LMCache` lines in the model log and `vllm:external_prefix_cache_hits_total` stays at 0.** Check the `vLLM server arguments` line for `--kv-transfer-config`. If it's missing, `SM_VLLM_KV_TRANSFER_CONFIG` is missing or misspelled.
-- **Step 8 shows no hit.** Either `PYTHONHASHSEED` isn't set in the model container (the log warns `PYTHONHASHSEED not set`), or the document was evicted from L2 before you came back to it, for example because other runs wrote to L2 in between: run Step 8 again with another `DOC_OFFSET`. Also check that the `ai-toolkit` pod on each GPU node is running.
+- **Step 8 shows no hit.** Either `PYTHONHASHSEED` isn't set in the model container (the log warns `PYTHONHASHSEED not set`), or the document was evicted from L2 before you came back to it, for example because other runs wrote to L2 in between. Run Step 8 again with another `DOC_OFFSET`. Also check that the `ai-toolkit` pod on each GPU node is running (Step 2).
 - **`Loading weights took` several seconds and the pod has no `cache-resolver` init container.** The pod started before the weights cache was warm and read the weights from S3. It still serves; scale to zero and back to pick up the cache.
 
 ## Going further
 
+For reference; nothing to run.
+
 - **Redis as L2.** `l2CacheBackend: redis` with `l2CacheLocalUrl` uses a Redis cluster you run, for example Amazon ElastiCache, instead of the nodes' memory. You size and secure it yourself; keep it in the cluster's VPC. Neither backend encrypts KV data at rest, and managed tiered storage doesn't isolate the deployments of a cluster from each other. See [KV caching and intelligent routing](https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-model-deployment-caching-routing.html).
-- **Other routing strategies.** `session` keeps a user session on one replica, `roundrobin` ignores the cache, and `kvaware` routes to the replica with the highest measured cache hit rate; `kvaware` needs `invocationEndpoint: v1/completions`. The strategy can be changed on a running deployment with `kubectl patch`; enabling routing can't.
-- **Disaggregated prefill and decode** (`pdSpec`) combines with these features for large models.
+- **Other routing strategies.** `session` keeps a user session on one replica, `roundrobin` ignores the cache, and `kvaware` routes to the replica with the highest measured cache hit rate; `kvaware` needs `invocationEndpoint: v1/completions`. You can change the strategy on a running deployment with `kubectl patch`, but you can't turn routing on for a running deployment.
+- **Disaggregated prefill and decode** (`pdSpec`) runs prompt processing and token generation on separate pods, and combines with these features for large models.

@@ -2,7 +2,7 @@
 # Prepares a SageMaker HyperPod EKS workshop cluster for the HyperPod inference dive deep:
 #   - replaces a Helm-installed inference operator with the amazon-sagemaker-hyperpod-inference
 #     EKS add-on, and creates the IAM roles and TLS bucket the add-on needs
-#   - creates the model bucket (module 4), and the ECR repository and CodeBuild project (module 5)
+#   - creates the model bucket (lab 4), and the ECR repository and CodeBuild project (lab 5)
 #   - writes env.sh at the repository root with the variables the pages use
 #   - frees pod slots on the GPU nodes (HyperPod allows 14 pods on an ml.g5.2xlarge): moves movable
 #     controllers to the CPU instance group and deletes the workshop's training-image pre-pull
@@ -99,7 +99,7 @@ Helm operator    : $($HELM_INSTALLED && echo "installed, will be removed" || ech
 Creates if missing:
   S3 buckets     : $TLS_BUCKET, $MODEL_BUCKET
   ECR repository : $ECR_REPOSITORY
-  CodeBuild      : $BUILD_PROJECT (module 5 image build)
+  CodeBuild      : $BUILD_PROJECT (lab 5 image build)
   IAM roles      : $EXEC_ROLE_NAME, $KEDA_ROLE_NAME, $ALB_ROLE_NAME, $GATED_ROLE_NAME,
                    $BUILD_ROLE_NAME
 EOF
@@ -128,8 +128,8 @@ else
 fi
 ECR_REPOSITORY_URL=$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$ECR_REPOSITORY
 
-log "CodeBuild project for module 5"
-# Module 5 builds its image here: the workshop editor has no Docker. The build runs in the cluster's
+log "CodeBuild project for lab 5"
+# The bring-your-own-container lab (5) builds its image here: the workshop editor has no Docker. The build runs in the cluster's
 # subnet so its Docker Hub pulls leave through this account's NAT gateway, not CodeBuild's shared addresses.
 SUBNET_ID=$(jq -r '.VpcConfig.Subnets[0]' <<<"$DESC")
 SECURITY_GROUP_ID=$(jq -r '.VpcConfig.SecurityGroupIds[0]' <<<"$DESC")
@@ -151,7 +151,7 @@ BUILD_POLICY=$(jq -cn --arg r "$REGION" --arg a "$ACCOUNT_ID" --arg p "$BUILD_PR
      Condition: {StringEquals: {"ec2:AuthorizedService": "codebuild.amazonaws.com"}}}
   ]}')
 if ! aws iam get-role --role-name "$BUILD_ROLE_NAME" >/dev/null 2>&1; then
-  aws iam create-role --role-name "$BUILD_ROLE_NAME" --description "CodeBuild for the HyperPod inference dive deep, module 5" \
+  aws iam create-role --role-name "$BUILD_ROLE_NAME" --description "CodeBuild for the HyperPod inference dive deep, lab 5" \
     --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
 fi
 aws iam put-role-policy --role-name "$BUILD_ROLE_NAME" --policy-name build --policy-document "$BUILD_POLICY"
@@ -168,7 +168,7 @@ phases:
 '
 PROJECT=$(jq -cn --arg n "$BUILD_PROJECT" --arg src "$MODEL_BUCKET/codebuild/$BUILD_PROJECT.zip" --arg spec "$BUILDSPEC" \
   --arg role "$BUILD_ROLE_ARN" --arg vpc "$VPC_ID" --arg subnet "$SUBNET_ID" --arg sg "$SECURITY_GROUP_ID" '{
-  name: $n, description: "Builds the module 5 vLLM image (HyperPod inference dive deep)",
+  name: $n, description: "Builds the lab 5 vLLM image (HyperPod inference dive deep)",
   source: {type: "S3", location: $src, buildspec: $spec},
   artifacts: {type: "NO_ARTIFACTS"},
   environment: {type: "LINUX_CONTAINER", image: "aws/codebuild/amazonlinux-x86_64-standard:5.0",
@@ -269,7 +269,7 @@ if ! $ADDON_INSTALLED; then
   aws eks create-addon --cluster-name "$EKS_CLUSTER_NAME" --addon-name "$ADDON" --addon-version "$ADDON_VERSION" \
     --configuration-values "$CONFIG" --resolve-conflicts OVERWRITE >/dev/null
 else
-  # Keep everything else (module 3 changes logging); only add the controller placement if it's missing
+  # Keep everything else (lab 3 changes logging); only add the controller placement if it's missing
   CURRENT=$(aws eks describe-addon --cluster-name "$EKS_CLUSTER_NAME" --addon-name "$ADDON" \
     --query addon.configurationValues --output text)
   WANTED=$(jq -c "$PLACE" <<<"${CURRENT:-{\}}")
@@ -339,7 +339,7 @@ EOF
 log "Bash kernel for the notebooks"
 # Usually installed already by scripts/install-kernel.sh; rerunning it is quick and harmless
 if ! "$HERE/install-kernel.sh"; then
-  echo "WARNING: could not install the Bash kernel; run the module pages in the terminal instead" >&2
+  echo "WARNING: could not install the Bash kernel; run the lab pages in the terminal instead" >&2
 fi
 
 log "Status"
