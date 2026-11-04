@@ -103,6 +103,9 @@ aws eks describe-addon --cluster-name $EKS_CLUSTER_NAME \
 kubectl get nodes -L node.kubernetes.io/instance-type
 ```
 
+> [!NOTE]
+> If a lab later finds the GPUs taken (a pod stays `Pending` with `Insufficient nvidia.com/gpu`), run `~/hyperpod-inference-dive-deep/scripts/reset-gpus.sh` (in a notebook, add `-y`: a cell can't answer its prompt). It lists every model, training job, and cache the labs leave behind, asks, deletes them, and shows what's left on each GPU node. Then redeploy `tinyllama-dd` if the lab needs it.
+
 ## Optional: Prometheus metrics
 
 Module 2's Prometheus trigger and module 3's metrics queries need the HyperPod observability add-on and an Amazon Managed Service for Prometheus workspace. To set them up (about 3 minutes; without `-y` the script asks first):
