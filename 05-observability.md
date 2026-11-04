@@ -62,7 +62,7 @@ The **HyperPod observability** add-on collects these metrics, plus GPU, node, an
 <details open>
 <summary><b>Query Prometheus (workshop accounts)</b></summary>
 
-Workshop accounts can't sign in to Grafana, because it needs IAM Identity Center. Query the same metrics the dashboard plots. This needs the add-on from the optional step on the [overview page](README.md):
+Workshop accounts can't sign in to Grafana, because it needs IAM Identity Center. Query the same metrics the dashboard plots. This needs the add-on from the optional step of [0. Set up your environment](00-setup.md#optional-prometheus-metrics):
 
 ```bash
 export AMP_ENDPOINT=$(aws eks describe-addon --cluster-name $EKS_CLUSTER_NAME \
